@@ -19,7 +19,7 @@ def main():
         st.error('Streamlit 1.52 이상이 필요합니다. Update_RSLab.bat을 실행한 뒤 서버를 다시 시작하세요.')
         st.stop()
     st.markdown('''<style>
-        .block-container {max-width:1600px; padding-top:1.2rem; padding-bottom:1rem;}
+        .block-container {max-width:1600px; padding-bottom:1rem;}
         [data-testid="stVerticalBlock"] {gap:0.65rem;}
         h1 {font-size:1.7rem !important; padding-bottom:0.3rem !important;}
         h2,h3 {padding-top:0.4rem !important; padding-bottom:0.35rem !important;}
