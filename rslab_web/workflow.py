@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from . import nnls_core, svm_core
+from .preprocess_core import spectrum_name
 
 
 class UploadStore:
@@ -98,15 +99,16 @@ def make_pool(session, stage):
         blocks.append(block if len(kept) == len(block) else block[kept])
         source = item['path'].name
         for pi in kept:
-            mapping = item['kind'] == 'mapping'
+            mapping = item['coords'] is not None
             x, y = item['coords'][pi] if mapping else (float('nan'), float('nan'))
-            name = f'x={x:g}, y={y:g}' if mapping else source
+            name = spectrum_name(item, pi)
             ids.append(f'{source} | {name}')
             sources.append(source)
             names.append(name)
             # File defaults preserve independent preparation units during splitting.
             groups.append(source)
-            row_meta.append(dict(x=float(x), y=float(y), mapping=mapping))
+            row_meta.append(dict(x=float(x), y=float(y), mapping=mapping,
+                                 input_kind=item['kind'], spectrum_index_1based=pi+1))
     if not blocks:
         raise ValueError('전달할 spectrum이 없습니다.')
     for axis in axes[1:]:
@@ -124,7 +126,11 @@ def make_pool(session, stage):
                       (stage == 'Range' or (blape and blape.get('input_stage') == 'Range')) else None,
                       blape=asdict(blape['params']) if blape else None,
                       final=asdict(result['params']) if stage == 'Final' else None,
-                      bands=result.get('bands') if stage in ('BLaPE','Final') else None)
+                      bands=result.get('bands') if stage in ('BLaPE','Final') else None,
+                      inputs=[dict(file=item['path'].name, kind=item['kind'],
+                                   spectra=len(item['raw']), points=len(item['axis']),
+                                   coordinates_available=item['coords'] is not None)
+                              for item in session.items])
     digest = hashlib.sha256()
     for array in (axis, matrix):
         # No second, full matrix-sized bytes object when the array is contiguous.
@@ -167,9 +173,9 @@ def nnls_packet(session, stage):
         for pi, signal in enumerate(result['arrays'][fi]):
             if (fi, pi) in session.excluded_pixels:
                 continue
-            mapping = item['kind'] == 'mapping'
+            mapping = item['coords'] is not None
             x, y = item['coords'][pi] if mapping else (float('nan'), float('nan'))
-            name = f'x={x:g}, y={y:g}' if mapping else item['path'].name
+            name = spectrum_name(item, pi)
             spectrum = nnls_core.Spectrum(_readonly(axis), _readonly(signal), name,
                                           item['path'].name, float(x), float(y), mapping)
             spectra.append(spectrum)

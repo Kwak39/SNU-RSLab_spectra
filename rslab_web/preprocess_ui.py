@@ -87,9 +87,10 @@ def plot_current(engine, session, stage, file_index, spectrum_index):
 def _input_files():
     store = st.session_state.pre_store
     st.markdown('**1 · 입력 파일**')
-    uploaded = st.file_uploader('Single / Mapping', type=['txt', 'csv', 'dat', 'tsv'],
+    uploaded = st.file_uploader('Single / Mapping / 다중 spectrum', type=['txt', 'csv', 'dat', 'tsv'],
         accept_multiple_files=True, key=f'pre_upload_{st.session_state.pre_upload_generation}',
-        help='여러 폴더에서 선택 → 목록 추가를 반복할 수 있습니다. UTF-8/CP949와 구분자는 자동 판별합니다.')
+        help='2열 single, 좌표가 있는 mapping, 첫 열이 파수축인 다중 spectrum을 함께 넣을 수 있습니다. '
+             '여러 폴더에서 선택 → 목록 추가를 반복하세요. 인코딩·구분자·입력 형식을 자동 판별합니다.')
     if st.button('목록에 추가', disabled=not uploaded, key='pre_add_files', width='stretch'):
         try:
             added, duplicates = store.add(file_pairs(uploaded))
@@ -319,7 +320,11 @@ def render():
         item = session.items[fi]
         pi = c.number_input('Spectrum 번호', min_value=1, max_value=len(item['raw']), value=1,
                             step=1, key=f'pre_view_pixel_{fi}_{len(item["raw"])}') - 1
-        if session.kind == 'mapping':
+        format_names = {'single': 'Single', 'mapping': 'Mapping · 좌표 있음',
+                        'matrix': '다중 spectrum · 좌표 없음'}
+        st.caption(f'{format_names[item["kind"]]} · {len(item["raw"]):,} spectra × '
+                   f'{len(item["axis"]):,} 원본 points')
+        if item['coords'] is not None:
             x, y = item['coords'][int(pi)]
             st.caption(f'선택 좌표 x={x:g}, y={y:g}')
             with st.expander('Mapping 위치 확인'):
@@ -330,6 +335,8 @@ def render():
                 ax.set_aspect('equal', adjustable='box')
                 st.pyplot(fig)
                 plt.close(fig)
+        elif item['kind'] == 'matrix':
+            st.caption('Spectrum 번호는 원본 intensity 열 순서입니다. 파일에 없는 위치 좌표는 생성하지 않습니다.')
         figure = plot_current(core, session, stage, fi, int(pi))
         st.pyplot(figure)
         plt.close(figure)
@@ -337,6 +344,9 @@ def render():
         _exports(session, stages)
     with log:
         st.caption(f'{session.kind} · {len(session.items)} files · {core.VERSION}')
+        st.dataframe([{'파일': item['path'].name, '자동 판별': format_names[item['kind']],
+                       'Spectra': len(item['raw']), '원본 points': len(item['axis'])}
+                      for item in session.items], hide_index=True, width='stretch')
         if st.session_state.messages:
             st.code('\n'.join(st.session_state.messages), language='text')
         st.json({name: vars(result['params']) for name, result in

@@ -24,7 +24,7 @@ from scipy.linalg import solveh_banded
 from scipy.special import expit
 from scipy.signal import savgol_filter
 
-VERSION = '2.5.1 AsLS/arPLS + Savitzky-Golay + native BLaPE + Final'
+VERSION = '2.5.2 automatic single/mapping/matrix + Savitzky-Golay + native BLaPE + Final'
 
 @dataclass(frozen=True)
 class InputSettings:
@@ -217,7 +217,7 @@ def integer(value, minimum, name):
     if type(value) is not int or value < minimum:
         raise ValueError(f'{name}: {minimum} 이상 정수를 입력하세요.')
 
-# %% 2. 입력 파일 읽기 / single 또는 mapping 자동 판별
+# %% 2. 입력 파일 읽기 / single, 좌표 mapping, 좌표 없는 matrix 자동 판별
 
 def input_rows(path, settings, cancel=None):
     integer(settings.skiprows, 0, 'skiprows')
@@ -262,41 +262,35 @@ def numeric(fields, path, number):
     return values
 
 def read_auto(path, settings=InputSettings(), cancel=None):
-    """A=y, B=x mapping; otherwise exactly two-column single spectrum."""
+    """Read point-major XY/matrices or row-major mapping with A=y, B=x.
+
+    Numeric-only files need an unambiguous monotonic axis. Explicit coordinate
+    placeholders identify mapping without guessing from the number of rows.
+    """
     path = Path(path).resolve()
     iterator = iter(input_rows(path, settings, cancel))
     first = next(iterator, None); second = next(iterator, None)
     if first is None or second is None:
         raise ValueError(f'{path.name}: 데이터가 부족합니다.')
-    if len(first[1]) == len(second[1]) == 2:
-        pairs = []
-        for number, fields in chain([first, second], iterator):
-            if len(fields) != 2:
-                raise ValueError(f'{path.name}, {number}행: single은 두 열이어야 합니다.')
-            try:
-                values = numeric(fields, path, number)
-            except ValueError:
-                # Only textual leading headers may be skipped, never NaN/Inf.
-                if not pairs:
-                    try: np.asarray(fields, dtype=float)
-                    except ValueError: continue
-                raise
-            pairs.append(values)
-        values = np.asarray(pairs)
-        if values.ndim != 2 or len(values) < 3:
-            raise ValueError(f'{path.name}: single 데이터가 최소 3점 필요합니다.')
-        axis = values[:, 0]; signals = values[:, 1][None, :]; coords = None
-        kind = 'single'
-    else:
-        width = len(second[1])
-        if width < 5:
-            raise ValueError(f'{path.name}: single/mapping 구조를 판별할 수 없습니다. Single/Mapping 파일 형식을 확인하세요.')
-        if len(first[1]) == width:
-            header = first[1][2:]  # Empty/named/numeric A,B placeholders are allowed.
-        elif len(first[1]) == width - 2:
-            header = first[1]  # Whitespace exports may omit A/B placeholders.
-        else:
-            raise ValueError(f'{path.name}: mapping 파수축과 intensity 열 수가 맞지 않습니다.')
+
+    def numbers(fields):
+        try:
+            return np.asarray(fields, dtype=float)
+        except ValueError:
+            return None
+
+    def monotonic(axis):
+        delta = np.diff(axis)
+        return len(axis) >= 3 and np.isfinite(axis).all() and (
+            np.all(delta > 0) or np.all(delta < 0))
+
+    width = len(second[1])
+    omitted_placeholders = width >= 5 and len(first[1]) == width - 2
+    named_placeholders = (width >= 5 and len(first[1]) == width
+                          and numbers(first[1][:2]) is None
+                          and numbers(first[1][2:]) is not None)
+    if omitted_placeholders or named_placeholders:
+        header = first[1] if omitted_placeholders else first[1][2:]
         axis = numeric(header, path, first[0]); locations = []; spectra = []
         for number, fields in chain([second], iterator):
             if len(fields) != len(axis) + 2:
@@ -304,6 +298,41 @@ def read_auto(path, settings=InputSettings(), cancel=None):
             values = numeric(fields, path, number)
             locations.append((values[1], values[0])); spectra.append(values[2:])
         coords = np.asarray(locations); signals = np.asarray(spectra); kind = 'mapping'
+    else:
+        rows = []; width = None
+        for number, fields in chain([first, second], iterator):
+            values = numbers(fields)
+            if values is None and not rows:
+                continue  # Optional leading text labels; A1 numeric is never skipped.
+            values = numeric(values if values is not None else fields, path, number)
+            if width is None:
+                width = len(values)
+            if len(values) != width or width < 2:
+                raise ValueError(f'{path.name}, {number}행: 파수축/intensity 열 수가 일치하지 않습니다.')
+            rows.append(values)
+        values = np.asarray(rows)
+        del rows
+        if values.ndim != 2:
+            raise ValueError(f'{path.name}: 숫자 데이터가 없습니다.')
+        column_axis = monotonic(values[:, 0])
+        row_axis = values.shape[1] >= 5 and monotonic(values[0, 2:])
+        if values.shape[1] == 2:
+            axis = values[:, 0]; signals = values[:, 1][None, :]
+            coords = None; kind = 'single'
+        elif column_axis and row_axis:
+            raise ValueError(f'{path.name}: 행과 열이 모두 파수축처럼 보여 자동 판별이 모호합니다. '
+                             '좌표 mapping 원본이라면 첫 행의 앞 두 칸을 y,x 또는 빈 칸으로 표시하세요.')
+        elif column_axis:
+            # All intensity columns and the very first data row are retained.
+            axis = values[:, 0]; signals = values[:, 1:].T
+            coords = None; kind = 'matrix'
+        elif row_axis:
+            axis = values[0, 2:]; signals = values[1:, 2:]
+            coords = values[1:, [1, 0]]; kind = 'mapping'
+        else:
+            raise ValueError(f'{path.name}: 파수축을 판별할 수 없습니다. '
+                             '2열 single, 첫 행이 파수축인 좌표 mapping, '
+                             '첫 열이 단조 파수축인 다중 spectrum 형식을 확인하세요.')
     order = np.argsort(axis, kind='stable')
     axis = axis[order]
     if len(axis) < 3 or np.any(np.diff(axis) <= 0):
@@ -312,7 +341,17 @@ def read_auto(path, settings=InputSettings(), cancel=None):
         for row in signals:
             row[:] = row[order]
     return dict(path=path, kind=kind, axis=axis, raw=signals, coords=coords,
+                input_format={'single': 'single_xy', 'mapping': 'mapping_yx_rows',
+                              'matrix': 'spectra_columns'}[kind],
                 export_order=np.argsort(order))
+
+
+def spectrum_name(item, index):
+    """Stable names without inventing spatial coordinates for a numeric matrix."""
+    if item['coords'] is not None:
+        x, y = item['coords'][index]
+        return f'x={x:g}, y={y:g}'
+    return item['path'].name if item['kind'] == 'single' else f'Spectrum {index+1}'
 
 # %% 3. AsLS baseline correction / 선택적 사전 이상치 보정
 import warnings
@@ -561,18 +600,18 @@ class SpectraSession:
             raise ValueError('파일을 선택하세요.')
         if len({p.name.casefold() for p in paths}) != len(paths):
             raise ValueError('동일한 파일명이 있습니다. 이름을 구분하세요.')
-        items = []; kind = None
+        items = []
         for i, path in enumerate(paths, 1):
             checkpoint(cancel)
             item = read_auto(path, settings, cancel)
-            if kind is not None and item['kind'] != kind:
-                raise ValueError(f'{path.name}: single과 mapping 파일을 함께 선택했습니다.')
-            kind = item['kind']; items.append(item)
-            emit('log', f'{i}. {path.name}: {kind}, {len(item["raw"])} spectra × {len(item["axis"])} points')
+            items.append(item)
+            emit('log', f'{i}. {path.name}: {item["kind"]}, {len(item["raw"])} spectra × {len(item["axis"])} points')
             emit('progress', (100*i/len(paths), f'파일 읽기 {i}/{len(paths)}'))
         checkpoint(cancel)
-        self.items = items; self.kind = kind; self.input_settings = replace(settings)
-        return kind
+        kinds = {item['kind'] for item in items}
+        self.items = items; self.kind = next(iter(kinds)) if len(kinds) == 1 else 'mixed'
+        self.input_settings = replace(settings)
+        return self.kind
 
     def run_asls(self, cfg=AsLSSettings(), emit=lambda *a: None, cancel=None):
         validate_asls(cfg)
@@ -765,9 +804,9 @@ class SpectraSession:
             for line in text.splitlines():
                 if not line.strip(): continue
                 fields = line.split(',')
-                if len(fields) != 3:
-                    raise ValueError('mapping은 한 줄에 파일번호,x,y를 입력하세요.')
-                req = (int(fields[0]), float(fields[1]), float(fields[2]))
+                if len(fields) not in (1, 2, 3):
+                    raise ValueError('파일번호 또는 파일번호,spectrum번호 또는 파일번호,x,y를 입력하세요.')
+                req = (int(fields[0]),) + tuple(float(v) for v in fields[1:])
                 if not np.isfinite(req[1:]).all():
                     raise ValueError('좌표는 유한한 숫자여야 합니다.')
                 requests.append(req)
@@ -777,12 +816,20 @@ class SpectraSession:
             if not 0 <= fi < len(self.items):
                 raise ValueError(f'파일 번호는 1~{len(self.items)}입니다.')
             pi = 0; item = self.items[fi]
-            if self.kind == 'mapping':
+            if item['coords'] is not None:
+                if len(req) != 3:
+                    raise ValueError('좌표 mapping은 파일번호,x,y를 입력하세요.')
                 distance = np.hypot(item['coords'][:, 0]-req[1], item['coords'][:, 1]-req[2])
                 pi = int(np.argmin(distance))
                 if distance[pi] > tolerance:
                     nearest = tuple(item['coords'][pi])
                     raise ValueError(f'{req}: 해당 좌표 없음. 가장 가까운 좌표: {nearest}')
+            elif len(req) == 2:
+                pi = int(req[1])-1
+                if req[1] != pi+1 or not 0 <= pi < len(item['raw']):
+                    raise ValueError(f'spectrum 번호는 1~{len(item["raw"])} 정수입니다.')
+            elif len(req) != 1 or len(item['raw']) != 1:
+                raise ValueError('좌표 없는 다중 spectrum은 파일번호,spectrum번호를 입력하세요.')
             selected.append((fi, pi))
         return selected
 
@@ -841,7 +888,7 @@ class SpectraSession:
 
     def label(self, selected):
         fi, pi = selected; item = self.items[fi]
-        suffix = '' if self.kind == 'single' else f' / x={item["coords"][pi,0]:g}, y={item["coords"][pi,1]:g}'
+        suffix = '' if item['kind'] == 'single' else f' / {spectrum_name(item, pi)}'
         return f'{fi+1}. {item["path"].name}{suffix}'
 
     def similarity_data(self, stage, selected, cancel=None):
@@ -916,8 +963,6 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
     kept = {fi: [pi for pi in range(len(item['raw']))
                  if (fi, pi) not in session.excluded_pixels]
             for fi, item in enumerate(session.items)}
-    if session.kind == 'mapping' and any(not indices for indices in kept.values()):
-        raise ValueError('한 파일의 모든 pixel이 제외되었습니다. 파일마다 최소 1개를 복원하세요.')
     included_files = [fi for fi, indices in kept.items() if indices]
     if not included_files:
         raise ValueError('모든 파일이 저장 제외되었습니다. 최소 1개 파일을 복원하세요.')
@@ -934,8 +979,12 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
                     processing_order=f"optional anomaly -> {session.asls_result['params'].method} -> native Gaussian/BLaPE + edge trim -> optional Final crop/interpolation",
                     sigma_unit='native input-axis points; Range does not resample', output_ranges={},
                     asls_export='Original wavenumber values/order/count; no interpolation',
-                    asls_single_layout='shared axis' if all(np.array_equal(x,session.asls_result['targets'][0])
-                        for x in session.asls_result['targets']) else 'per-file wavenumber/intensity pairs; blank padding')
+                    asls_single_layout=('not applicable; one CSV per input file' if session.kind != 'single'
+                        else 'shared axis' if all(np.array_equal(x,session.asls_result['targets'][0])
+                        for x in session.asls_result['targets']) else 'per-file wavenumber/intensity pairs; blank padding'))
+    metadata['detected_inputs'] = [dict(file=item['path'].name, kind=item['kind'],
+        input_format=item.get('input_format'), spectra=len(item['raw']), points=len(item['axis']),
+        coordinates_available=item['coords'] is not None) for item in session.items]
     if 'Range' in stages or (any(v in stages for v in ('BLaPE','Final')) and session.blape_result['input_stage']=='Range'):
         metadata.update(range_parameters=asdict(session.range_result['params']),
                         range_computed_at=session.range_result['computed_at'],
@@ -968,15 +1017,28 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
     metadata['excluded_mapping_pixels'] = [
         dict(file=session.items[fi]['path'].name, spectrum_index_1based=pi+1,
              x=float(session.items[fi]['coords'][pi,0]), y=float(session.items[fi]['coords'][pi,1]))
-        for fi, pi in sorted(session.excluded_pixels) if session.kind == 'mapping']
+        for fi, pi in sorted(session.excluded_pixels) if session.items[fi]['coords'] is not None]
     metadata['excluded_single_files'] = [session.items[fi]['path'].name
-        for fi, pi in sorted(session.excluded_pixels) if session.kind == 'single']
+        for fi, pi in sorted(session.excluded_pixels) if session.items[fi]['kind'] == 'single']
+    metadata['excluded_matrix_spectra'] = [dict(file=session.items[fi]['path'].name,
+        spectrum_index_1based=pi+1) for fi, pi in sorted(session.excluded_pixels)
+        if session.items[fi]['kind'] == 'matrix']
     metadata['exported_spectra_per_file'] = {session.items[fi]['path'].name: len(v) for fi,v in kept.items()}
     def settings():
         with (folder/'parameters.csv').open('w', encoding='utf-8-sig', newline='') as f:
             w = csv.writer(f); w.writerow(['parameter', 'value'])
             for k, v in metadata.items():
                 w.writerow([k, json.dumps(v, ensure_ascii=False) if isinstance(v, (dict, list, tuple)) else v])
+
+    def write_header(writer, indices):
+        item = session.items[indices[0]]
+        if len(indices) == 1 and item['coords'] is not None:
+            coords = item['coords'][kept[indices[0]]]
+            writer.writerow(['x coordinate']+coords[:,0].tolist())
+            writer.writerow(['y coordinate']+coords[:,1].tolist())
+        writer.writerow(['Raman shift (cm^-1)']+[spectrum_name(session.items[fi], pi)
+            for fi in indices for pi in kept[fi]])
+
     def write_native(path, indices, stage):
         snapshot = {'AsLS':session.asls_result,'Range':session.range_result,'BLaPE':session.blape_result}[stage]
         orders = ([item['export_order'] for item in session.items] if stage=='AsLS'
@@ -987,24 +1049,17 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
         partial = path.with_suffix('.csv.partial')
         with partial.open('w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f)
-            if session.kind == 'mapping':
-                coords = session.items[indices[0]]['coords'][kept[indices[0]]]
-                writer.writerow(['x coordinate']+coords[:,0].tolist())
-                writer.writerow(['y coordinate']+coords[:,1].tolist())
-                writer.writerow(['Raman shift (cm^-1)']+[f'x={x:g}, y={y:g}' for x,y in coords])
-            elif shared:
-                writer.writerow(['Raman shift (cm^-1)']+[session.items[i]['path'].name for i in indices])
+            if shared:
+                write_header(writer, indices)
             else:
                 writer.writerow([label for i in indices for label in
                     (f'{session.items[i]["path"].name} | wavenumber', f'{session.items[i]["path"].name} | {session.asls_result["params"].method if stage == "AsLS" else stage}')])
             count = max(len(axis) for axis in axes)
             for j in range(count):
                 if j % 32 == 0: checkpoint(cancel)
-                if session.kind == 'mapping':
-                    fi = indices[0]; original_j = orders[fi][j]
-                    row = [axes[0][j]]+snapshot['arrays'][fi][kept[fi],original_j].tolist()
-                elif shared:
-                    row = [axes[0][j]]+[snapshot['arrays'][fi][0,orders[fi][j]] for fi in indices]
+                if shared:
+                    row = [axes[0][j]]+[snapshot['arrays'][fi][pi,orders[fi][j]]
+                                       for fi in indices for pi in kept[fi]]
                 else:
                     row = []
                     for fi, axis in zip(indices, axes):
@@ -1022,13 +1077,7 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
         snapshot = {'AsLS':session.asls_result,'Range':session.range_result,'BLaPE':session.blape_result,'Final':session.final_result}[stage]
         with partial.open('w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f)
-            if session.kind == 'mapping':
-                coords = session.items[indices[0]]['coords'][kept[indices[0]]]
-                writer.writerow(['x coordinate']+coords[:,0].tolist())
-                writer.writerow(['y coordinate']+coords[:,1].tolist())
-                writer.writerow(['Raman shift (cm^-1)']+[f'x={x:g}, y={y:g}' for x,y in coords])
-            else:
-                writer.writerow(['Raman shift (cm^-1)']+[session.items[i]['path'].name for i in indices])
+            write_header(writer, indices)
             # Final is already sampled on the common physical output axis.
             count = sum(len(kept[i]) for i in indices)
             for start in range(0, len(target), 64):
@@ -1069,9 +1118,10 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
             if session.kind == 'single':
                 write_result(folder/f'single_{export_name}_spectra.csv', stage, included_files, snapshot['targets'][included_files[0]])
             else:
-                for fi, item in enumerate(session.items):
+                for fi in included_files:
+                    item = session.items[fi]
                     # Full input filename avoids same-stem TXT/CSV collisions.
-                    write_result(folder/f'{item["path"].name}_mapping_{export_name}.csv', stage, [fi], snapshot['targets'][fi])
+                    write_result(folder/f'{item["path"].name}_{item["kind"]}_{export_name}.csv', stage, [fi], snapshot['targets'][fi])
         checkpoint(cancel); metadata['status'] = 'complete'; settings()
         return folder
     except BaseException as exc:
