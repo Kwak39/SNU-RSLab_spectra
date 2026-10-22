@@ -24,7 +24,7 @@ from scipy.linalg import solveh_banded
 from scipy.special import expit
 from scipy.signal import savgol_filter
 
-VERSION = '2.5.2 automatic single/mapping/matrix + Savitzky-Golay + native BLaPE + Final'
+VERSION = '2.5.3 A1/column-layout detection + Savitzky-Golay + native BLaPE + Final'
 
 @dataclass(frozen=True)
 class InputSettings:
@@ -264,8 +264,10 @@ def numeric(fields, path, number):
 def read_auto(path, settings=InputSettings(), cancel=None):
     """Read point-major XY/matrices or row-major mapping with A=y, B=x.
 
-    Numeric-only files need an unambiguous monotonic axis. Explicit coordinate
-    placeholders identify mapping without guessing from the number of rows.
+    A numeric A1 in a rectangular table fixes the axis to column A: two columns
+    are single, more columns are a matrix. Intensities never vote on orientation.
+    Empty/named coordinate corners identify mapping. A shorter axis-only header
+    also supports legacy whitespace mapping exports with omitted placeholders.
     """
     path = Path(path).resolve()
     iterator = iter(input_rows(path, settings, cancel))
@@ -279,15 +281,14 @@ def read_auto(path, settings=InputSettings(), cancel=None):
         except ValueError:
             return None
 
-    def monotonic(axis):
-        delta = np.diff(axis)
-        return len(axis) >= 3 and np.isfinite(axis).all() and (
-            np.all(delta > 0) or np.all(delta < 0))
-
     width = len(second[1])
-    omitted_placeholders = width >= 5 and len(first[1]) == width - 2
+    omitted_placeholders = (width >= 5 and len(first[1]) == width - 2
+                            and numbers(first[1]) is not None)
+    y_labels = {'', 'y', 'y coordinate', 'y position', 'position y', 'pos y'}
+    x_labels = {'', 'x', 'x coordinate', 'x position', 'position x', 'pos x'}
     named_placeholders = (width >= 5 and len(first[1]) == width
-                          and numbers(first[1][:2]) is None
+                          and first[1][0].casefold().replace('_', ' ') in y_labels
+                          and first[1][1].casefold().replace('_', ' ') in x_labels
                           and numbers(first[1][2:]) is not None)
     if omitted_placeholders or named_placeholders:
         header = first[1] if omitted_placeholders else first[1][2:]
@@ -302,7 +303,7 @@ def read_auto(path, settings=InputSettings(), cancel=None):
         rows = []; width = None
         for number, fields in chain([first, second], iterator):
             values = numbers(fields)
-            if values is None and not rows:
+            if values is None and not rows and numbers(fields[:1]) is None:
                 continue  # Optional leading text labels; A1 numeric is never skipped.
             values = numeric(values if values is not None else fields, path, number)
             if width is None:
@@ -314,25 +315,10 @@ def read_auto(path, settings=InputSettings(), cancel=None):
         del rows
         if values.ndim != 2:
             raise ValueError(f'{path.name}: 숫자 데이터가 없습니다.')
-        column_axis = monotonic(values[:, 0])
-        row_axis = values.shape[1] >= 5 and monotonic(values[0, 2:])
-        if values.shape[1] == 2:
-            axis = values[:, 0]; signals = values[:, 1][None, :]
-            coords = None; kind = 'single'
-        elif column_axis and row_axis:
-            raise ValueError(f'{path.name}: 행과 열이 모두 파수축처럼 보여 자동 판별이 모호합니다. '
-                             '좌표 mapping 원본이라면 첫 행의 앞 두 칸을 y,x 또는 빈 칸으로 표시하세요.')
-        elif column_axis:
-            # All intensity columns and the very first data row are retained.
-            axis = values[:, 0]; signals = values[:, 1:].T
-            coords = None; kind = 'matrix'
-        elif row_axis:
-            axis = values[0, 2:]; signals = values[1:, 2:]
-            coords = values[1:, [1, 0]]; kind = 'mapping'
-        else:
-            raise ValueError(f'{path.name}: 파수축을 판별할 수 없습니다. '
-                             '2열 single, 첫 행이 파수축인 좌표 mapping, '
-                             '첫 열이 단조 파수축인 다중 spectrum 형식을 확인하세요.')
+        # A1=0 is a real point, never an empty coordinate placeholder. Keep
+        # row 1 and every intensity column, even if intensities are monotonic.
+        axis = values[:, 0]; signals = values[:, 1:].T
+        coords = None; kind = 'single' if values.shape[1] == 2 else 'matrix'
     order = np.argsort(axis, kind='stable')
     axis = axis[order]
     if len(axis) < 3 or np.any(np.diff(axis) <= 0):
