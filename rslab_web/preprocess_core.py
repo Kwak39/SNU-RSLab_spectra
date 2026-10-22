@@ -24,7 +24,8 @@ from scipy.linalg import solveh_banded
 from scipy.special import expit
 from scipy.signal import savgol_filter
 
-VERSION = '2.5.3 A1/column-layout detection + Savitzky-Golay + native BLaPE + Final'
+INPUT_PATCH = 'TXT-2.5.4'
+VERSION = '2.5.4 A1/column-layout detection + Savitzky-Golay + native BLaPE + Final'
 
 @dataclass(frozen=True)
 class InputSettings:

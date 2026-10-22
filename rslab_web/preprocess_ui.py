@@ -11,8 +11,16 @@ import matplotlib.pyplot as plt
 import streamlit as st
 
 from . import preprocess_core as core
+from . import workflow
 from .common import file_pairs
-from .workflow import UploadStore, clear_results, make_pool
+from .workflow import UploadStore, clear_ml, clear_results, make_pool
+
+INPUT_PATCH = 'TXT-2.5.4'
+
+
+def compatible_input_files():
+    return (getattr(core, 'INPUT_PATCH', None) == INPUT_PATCH
+            and getattr(workflow, 'INPUT_PATCH', None) == INPUT_PATCH)
 
 
 def load_core():
@@ -24,16 +32,25 @@ def init_state():
         st.session_state.pre_temp = tempfile.TemporaryDirectory(prefix='rslab_streamlit_')
         st.session_state.workdir = Path(st.session_state.pre_temp.name)
     for key, value in [('session', None), ('processed', False), ('messages', []),
-                       ('pre_upload_generation', 0)]:
+                       ('pre_upload_generation', 0), ('pre_point_generation', 0)]:
         st.session_state.setdefault(key, value)
     if 'pre_store' not in st.session_state:
         st.session_state.pre_store = UploadStore(Path(st.session_state.workdir) / 'inputs')
+    if st.session_state.get('pre_engine_version') != core.VERSION:
+        if st.session_state.session is not None or st.session_state.get('ml_pool') is not None:
+            reset_session()
+            if st.session_state.get('ml_pool') is not None:
+                clear_ml(st.session_state)
+            st.session_state.pre_notice = ('입력 엔진 업데이트: 이전 전처리 결과를 초기화했습니다. '
+                '입력 파일 목록은 유지됩니다. 전처리를 다시 실행하고 ML로 보내세요.')
+        st.session_state.pre_engine_version = core.VERSION
 
 
 def reset_session(remove_files=False):
     st.session_state.session = None
     st.session_state.processed = False
     st.session_state.messages = []
+    st.session_state.pre_point_generation = st.session_state.get('pre_point_generation', 0) + 1
     for key in ('export_zip', 'export_choice', 'pre_load_token'):
         st.session_state.pop(key, None)
     if remove_files:
@@ -82,6 +99,87 @@ def plot_current(engine, session, stage, file_index, spectrum_index):
     figure.suptitle(data['label'], fontsize=9)
     figure.tight_layout()
     return figure
+
+
+def _picked_spectrum(event, count):
+    """Read field-projected Vega point selections, never coordinate/row guessing."""
+    picked = (event or {}).get('selection', {}).get('mapping_pick', {})
+    if isinstance(picked, dict):
+        values = picked.get('spectrum', [])
+    elif isinstance(picked, list):
+        values = [row.get('spectrum') for row in picked if isinstance(row, dict)]
+    else:
+        return None
+    if not isinstance(values, (list, tuple)):
+        values = [values]
+    if len(values) != 1 or isinstance(values[0], bool):
+        return None
+    try:
+        number = int(values[0])
+        return number if float(values[0]) == number and 1 <= number <= count else None
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _mapping_click(chart_key, number_key, count):
+    # Streamlit runs callbacks before the number-input widget is instantiated.
+    number = _picked_spectrum(st.session_state.get(chart_key), count)
+    if number is not None:
+        st.session_state[number_key] = number
+
+
+def mapping_spec(session, fi, pi):
+    item = session.items[fi]
+    rows = [dict(spectrum=i+1, x=float(x), y=float(y),
+                 status='제외' if (fi, i) in session.excluded_pixels else '저장 대상',
+                 current=i == pi)
+            for i, (x, y) in enumerate(item['coords'])]
+    return dict(data=dict(values=rows), height=250,
+        mark=dict(type='circle', cursor='pointer', opacity=1),
+        params=[dict(name='mapping_pick', select=dict(type='point', fields=['spectrum'],
+                     toggle=False, clear='dblclick'))],
+        encoding=dict(
+            x=dict(field='x', type='quantitative', title='x position', scale=dict(zero=False)),
+            y=dict(field='y', type='quantitative', title='y position', scale=dict(zero=False, reverse=True)),
+            color=dict(field='status', type='nominal', title=None,
+                       scale=dict(domain=['저장 대상', '제외'], range=['#2878b5', '#d64242']),
+                       legend=dict(orient='bottom')),
+            size=dict(condition=dict(test='datum.current', value=220), value=90),
+            stroke=dict(condition=dict(test='datum.current', value='#f0a000'), value='white'),
+            strokeWidth=dict(condition=dict(test='datum.current', value=3), value=1),
+            tooltip=[dict(field='spectrum', type='ordinal', title='Spectrum'),
+                     dict(field='x', type='quantitative'), dict(field='y', type='quantitative'),
+                     dict(field='status', type='nominal', title='상태')]))
+
+
+def set_excluded(session, fi, pi, excluded, restore_file=False):
+    """Change export membership only; raw/corrected arrays remain available."""
+    if not 0 <= fi < len(session.items) or not 0 <= pi < len(session.items[fi]['raw']):
+        raise ValueError('유효하지 않은 spectrum 번호입니다.')
+    if restore_file:
+        session.excluded_pixels.difference_update(
+            {(fi, index) for index in range(len(session.items[fi]['raw']))})
+    elif excluded:
+        session.excluded_pixels.add((fi, pi))
+    else:
+        session.excluded_pixels.discard((fi, pi))
+
+
+def _exclusion_controls(session, fi, pi):
+    excluded = (fi, pi) in session.excluded_pixels
+    removed = sum((fi, i) in session.excluded_pixels for i in range(len(session.items[fi]['raw'])))
+    st.caption(f'현재 spectrum: {"제외" if excluded else "저장 대상"} · '
+               f'이 파일 {len(session.items[fi]["raw"])-removed:,}개 포함 / {removed:,}개 제외')
+    a, b, c = st.columns(3)
+    if a.button('현재 지점 제외', disabled=excluded, key='pre_point_exclude', width='stretch'):
+        set_excluded(session, fi, pi, True)
+        st.rerun()
+    if b.button('현재 지점 복원', disabled=not excluded, key='pre_point_restore', width='stretch'):
+        set_excluded(session, fi, pi, False)
+        st.rerun()
+    if c.button('이 파일 전체 복원', disabled=not removed, key='pre_file_restore', width='stretch'):
+        set_excluded(session, fi, pi, False, restore_file=True)
+        st.rerun()
 
 
 def _input_files():
@@ -213,7 +311,7 @@ def _run(settings):
             exclusion_margin=float(settings['margin']), sg_enabled=settings['sg_enabled'],
             sg_window=settings['sg_window'], sg_order=settings['sg_order'])
         input_settings = core.InputSettings()
-        load_token = (store.revision, input_settings)
+        load_token = (INPUT_PATCH, core.VERSION, store.revision, input_settings)
         reused = st.session_state.get('pre_load_token') == load_token and st.session_state.session is not None
         session = st.session_state.session if reused else core.SpectraSession()
         logs = []
@@ -256,6 +354,15 @@ def _run(settings):
 
 def _exports(session, stages):
     names = {'AsLS': session.asls_result['params'].method, 'BLaPE': 'BLaPE', 'Final': 'Final'}
+    total = sum(len(item['raw']) for item in session.items)
+    kept = total - len(session.excluded_pixels)
+    st.caption(f'저장·다음 ML 전달 대상 {kept:,} / {total:,} spectra · 제외 {total-kept:,}개')
+    token = (st.session_state.pre_point_generation, id(session))
+    if (st.session_state.get('pre_bridge_token') == token and
+            st.session_state.get('pre_bridge_exclusions') != frozenset(session.excluded_pixels)):
+        st.warning('ML 전달 후 제외 목록이 변경되었습니다. ML로 보내기를 다시 눌러 반영하세요.')
+    if not kept:
+        st.warning('모든 spectrum이 제외되었습니다. 처리 결과 확인에서 저장할 지점을 복원하세요.')
     left, right = st.columns(2, gap='large')
     with left:
         st.markdown('**CSV ZIP**')
@@ -267,12 +374,12 @@ def _exports(session, stages):
         st.download_button('ZIP 만들기 · 다운로드',
             data=lambda: make_export_zip(core, snapshot, selection[0], False, selection[1], selection[2]),
             file_name='RSLab_Spectra_results.zip', mime='application/zip',
-            disabled=not any(choices), on_click='ignore', key='pre_download', width='stretch')
+            disabled=not any(choices) or not kept, on_click='ignore', key='pre_download', width='stretch')
     with right:
         st.markdown('**ML 공용 데이터로 전달**')
         stage = st.selectbox('전달 단계', stages, index=len(stages)-1,
                              format_func=lambda value: names[value], key='bridge_stage')
-        if st.button('ML로 보내기', key='bridge_send', width='stretch'):
+        if st.button('ML로 보내기', key='bridge_send', disabled=not kept, width='stretch'):
             try:
                 pool = make_pool(session, stage)
                 if st.session_state.get('ml_pool') is None or st.session_state.ml_pool.signature != pool.signature:
@@ -282,12 +389,19 @@ def _exports(session, stages):
                         clear_results(st.session_state, tool)
                 for tool in ('svm', 'knn', 'nnls'):
                     st.session_state[f'{tool}_input_mode'] = '전처리 데이터'
+                st.session_state.pre_bridge_token = token
+                st.session_state.pre_bridge_exclusions = frozenset(session.excluded_pixels)
                 st.success(f'{names[stage]} · {len(pool.data.X):,} spectra 전달. ML 탭에서 Label/TRAIN/TEST를 지정하세요.')
             except Exception as exc:
                 st.error(str(exc))
 
 
 def render():
+    st.caption(f'입력 패치 {INPUT_PATCH}')
+    if not compatible_input_files():
+        st.error('입력 패치의 파일 버전이 일치하지 않습니다. rslab_web 폴더의 preprocess_core.py, '
+                 'preprocess_ui.py, workflow.py를 같은 ZIP의 파일로 교체한 뒤 앱을 재시작하세요.')
+        return
     init_state()
     st.caption('파일 누적 → AsLS / arPLS → Savitzky–Golay (선택) → 원본 축 BLaPE → Final 공통축 → ML')
     settings = _settings()
@@ -318,28 +432,37 @@ def render():
         fi = b.selectbox('파일', range(len(session.items)),
                          format_func=lambda i: session.items[i]['path'].name, key='pre_view_file')
         item = session.items[fi]
+        number_key = f'pre_view_pixel_{fi}_{len(item["raw"])}'
         pi = c.number_input('Spectrum 번호', min_value=1, max_value=len(item['raw']), value=1,
-                            step=1, key=f'pre_view_pixel_{fi}_{len(item["raw"])}') - 1
+                            step=1, key=number_key) - 1
         format_names = {'single': 'Single', 'mapping': 'Mapping · 좌표 있음',
                         'matrix': '다중 spectrum · 좌표 없음'}
         st.caption(f'{format_names[item["kind"]]} · {len(item["raw"]):,} spectra × '
-                   f'{len(item["axis"]):,} 원본 points')
+                   f'{len(item["axis"]):,} 원본 points · '
+                   f'파수 {item["axis"][0]:.3f}–{item["axis"][-1]:.3f} cm⁻¹')
         if item['coords'] is not None:
             x, y = item['coords'][int(pi)]
             st.caption(f'선택 좌표 x={x:g}, y={y:g}')
-            with st.expander('Mapping 위치 확인'):
-                fig, ax = plt.subplots(figsize=(3, 2.5))
-                ax.scatter(item['coords'][:, 0], item['coords'][:, 1], s=9)
-                ax.scatter(x, y, s=60, facecolors='none', edgecolors='orange')
-                ax.invert_yaxis()
-                ax.set_aspect('equal', adjustable='box')
-                st.pyplot(fig)
-                plt.close(fig)
+            location, spectrum = st.columns([1, 3], gap='medium')
+            with location:
+                # A fresh selection after a preview change also lets a user
+                # click a previously selected point after entering a number.
+                chart_key = f'pre_map_{st.session_state.pre_point_generation}_{fi}_{int(pi)}'
+                st.vega_lite_chart(spec=mapping_spec(session, fi, int(pi)),
+                    use_container_width=True, key=chart_key, selection_mode='mapping_pick',
+                    on_select=lambda: _mapping_click(chart_key, number_key, len(item['raw'])))
+                st.caption('지점을 클릭하면 오른쪽 spectrum이 바뀝니다. 주황 테두리: 현재 선택')
+            with spectrum:
+                figure = plot_current(core, session, stage, fi, int(pi))
+                st.pyplot(figure)
+                plt.close(figure)
         elif item['kind'] == 'matrix':
             st.caption('Spectrum 번호는 원본 intensity 열 순서입니다. 파일에 없는 위치 좌표는 생성하지 않습니다.')
-        figure = plot_current(core, session, stage, fi, int(pi))
-        st.pyplot(figure)
-        plt.close(figure)
+        if item['coords'] is None:
+            figure = plot_current(core, session, stage, fi, int(pi))
+            st.pyplot(figure)
+            plt.close(figure)
+        _exclusion_controls(session, fi, int(pi))
     with export:
         _exports(session, stages)
     with log:

@@ -8,7 +8,9 @@ from pathlib import Path
 import numpy as np
 
 from . import nnls_core, svm_core
-from .preprocess_core import spectrum_name
+from . import preprocess_core
+
+INPUT_PATCH = 'TXT-2.5.4'
 
 
 class UploadStore:
@@ -101,7 +103,7 @@ def make_pool(session, stage):
         for pi in kept:
             mapping = item['coords'] is not None
             x, y = item['coords'][pi] if mapping else (float('nan'), float('nan'))
-            name = spectrum_name(item, pi)
+            name = preprocess_core.spectrum_name(item, pi)
             ids.append(f'{source} | {name}')
             sources.append(source)
             names.append(name)
@@ -175,7 +177,7 @@ def nnls_packet(session, stage):
                 continue
             mapping = item['coords'] is not None
             x, y = item['coords'][pi] if mapping else (float('nan'), float('nan'))
-            name = spectrum_name(item, pi)
+            name = preprocess_core.spectrum_name(item, pi)
             spectrum = nnls_core.Spectrum(_readonly(axis), _readonly(signal), name,
                                           item['path'].name, float(x), float(y), mapping)
             spectra.append(spectrum)
