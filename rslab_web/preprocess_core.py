@@ -24,8 +24,8 @@ from scipy.linalg import solveh_banded
 from scipy.special import expit
 from scipy.signal import savgol_filter
 
-INPUT_PATCH = 'TXT-2.5.4'
-VERSION = '2.5.4 A1/column-layout detection + Savitzky-Golay + native BLaPE + Final'
+INPUT_PATCH = 'TXT-2.5.6'
+VERSION = '2.5.6 variable-length metadata + A1/column-layout + native BLaPE + Final'
 
 @dataclass(frozen=True)
 class InputSettings:
@@ -271,26 +271,59 @@ def read_auto(path, settings=InputSettings(), cancel=None):
     also supports legacy whitespace mapping exports with omitted placeholders.
     """
     path = Path(path).resolve()
-    iterator = iter(input_rows(path, settings, cancel))
-    first = next(iterator, None); second = next(iterator, None)
-    if first is None or second is None:
-        raise ValueError(f'{path.name}: 데이터가 부족합니다.')
-
     def numbers(fields):
         try:
             return np.asarray(fields, dtype=float)
         except ValueError:
             return None
 
+    y_labels = {'', 'y', 'y coordinate', 'y position', 'position y', 'pos y'}
+    x_labels = {'', 'x', 'x coordinate', 'x position', 'position x', 'pos x'}
+
+    def mapping_corner(fields):
+        return (len(fields) >= 5
+                and fields[0].casefold().replace('_', ' ') in y_labels
+                and fields[1].casefold().replace('_', ' ') in x_labels)
+
+    def labelled_parameter_value(fields):
+        # Some instruments write "Laser:" then "785" or "785 nm" on the
+        # next line. These are labelled conditions, not incomplete XY rows.
+        if not leading_metadata:
+            return False
+        previous_label = ' '.join(leading_metadata[-1]['fields']).strip()
+        if not previous_label.endswith((':', '=')):
+            return False
+        label = previous_label[:-1].strip().casefold()
+        if not label or label in {'data', 'xydata', 'spectrum', 'spectral data',
+                                  'raman shift', 'wavenumber', '데이터', '파수'}:
+            return False
+        if len(fields) == 1:
+            return numbers(fields) is not None
+        units = {'nm', 's', 'sec', 'seconds', 'ms', 'us', 'µs', 'μs', 'mw', 'w', '%',
+                 'c', '°c', 'k', 'cm-1', 'cm^-1'}
+        return (len(fields) == 2 and numbers(fields[:1]) is not None
+                and fields[1].casefold() in units)
+
+    # Find the actual table before detecting its orientation. A mapping header
+    # with empty A1/B1 is data, and must never be discarded as metadata.
+    iterator = iter(input_rows(path, settings, cancel))
+    leading_metadata = []
+    first = None
+    for number, fields in iterator:
+        # No row-count limit or fixed skip count: inspect row contents until a
+        # numeric table or a physical mapping axis header begins.
+        if not labelled_parameter_value(fields) and (
+                mapping_corner(fields) or numbers(fields[:1]) is not None):
+            first = (number, fields)
+            break
+        leading_metadata.append(dict(line=number, fields=fields))
+    second = next(iterator, None)
+    if first is None or second is None:
+        raise ValueError(f'{path.name}: 메타데이터 뒤에 스펙트럼 데이터가 부족합니다.')
     width = len(second[1])
     omitted_placeholders = (width >= 5 and len(first[1]) == width - 2
                             and numbers(first[1]) is not None)
-    y_labels = {'', 'y', 'y coordinate', 'y position', 'position y', 'pos y'}
-    x_labels = {'', 'x', 'x coordinate', 'x position', 'position x', 'pos x'}
-    named_placeholders = (width >= 5 and len(first[1]) == width
-                          and first[1][0].casefold().replace('_', ' ') in y_labels
-                          and first[1][1].casefold().replace('_', ' ') in x_labels
-                          and numbers(first[1][2:]) is not None)
+    named_placeholders = mapping_corner(first[1])
     if omitted_placeholders or named_placeholders:
         header = first[1] if omitted_placeholders else first[1][2:]
         axis = numeric(header, path, first[0]); locations = []; spectra = []
@@ -328,6 +361,8 @@ def read_auto(path, settings=InputSettings(), cancel=None):
         for row in signals:
             row[:] = row[order]
     return dict(path=path, kind=kind, axis=axis, raw=signals, coords=coords,
+                data_start_line=first[0], leading_metadata=leading_metadata,
+                header_detection='content-based, variable-length preamble',
                 input_format={'single': 'single_xy', 'mapping': 'mapping_yx_rows',
                               'matrix': 'spectra_columns'}[kind],
                 export_order=np.argsort(order))
@@ -592,7 +627,8 @@ class SpectraSession:
             checkpoint(cancel)
             item = read_auto(path, settings, cancel)
             items.append(item)
-            emit('log', f'{i}. {path.name}: {item["kind"]}, {len(item["raw"])} spectra × {len(item["axis"])} points')
+            emit('log', f'{i}. {path.name}: {item["kind"]}, {len(item["raw"])} spectra × {len(item["axis"])} points · '
+                 f'데이터 시작 {item["data_start_line"]}행 · 상단 메타데이터 {len(item["leading_metadata"])}행')
             emit('progress', (100*i/len(paths), f'파일 읽기 {i}/{len(paths)}'))
         checkpoint(cancel)
         kinds = {item['kind'] for item in items}
@@ -971,6 +1007,8 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
                         for x in session.asls_result['targets']) else 'per-file wavenumber/intensity pairs; blank padding'))
     metadata['detected_inputs'] = [dict(file=item['path'].name, kind=item['kind'],
         input_format=item.get('input_format'), spectra=len(item['raw']), points=len(item['axis']),
+        data_start_line=item.get('data_start_line'), leading_metadata=item.get('leading_metadata', []),
+        header_detection=item.get('header_detection'),
         coordinates_available=item['coords'] is not None) for item in session.items]
     if 'Range' in stages or (any(v in stages for v in ('BLaPE','Final')) and session.blape_result['input_stage']=='Range'):
         metadata.update(range_parameters=asdict(session.range_result['params']),

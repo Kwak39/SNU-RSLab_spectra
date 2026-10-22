@@ -15,7 +15,7 @@ from . import workflow
 from .common import file_pairs
 from .workflow import UploadStore, clear_ml, clear_results, make_pool
 
-INPUT_PATCH = 'TXT-2.5.4'
+INPUT_PATCH = 'TXT-2.5.6'
 
 
 def compatible_input_files():
@@ -152,6 +152,69 @@ def mapping_spec(session, fi, pi):
                      dict(field='status', type='nominal', title='상태')]))
 
 
+def index_spec(session, fi, pi):
+    """Numbered tiles follow column order; they carry no spatial coordinates."""
+    start = (pi // 100) * 100
+    stop = min(start+100, len(session.items[fi]['raw']))
+    rows = [dict(spectrum=i+1, column=(i-start) % 10, row=(i-start) // 10,
+                 status='제외' if (fi, i) in session.excluded_pixels else '저장 대상',
+                 current=i == pi) for i in range(start, stop)]
+    return dict(data=dict(values=rows), height=max(110, ((stop-start+9)//10)*28),
+        params=[dict(name='mapping_pick', select=dict(type='point', fields=['spectrum'],
+                     toggle=False, clear='dblclick'))],
+        encoding=dict(
+            x=dict(field='column', type='ordinal', axis=None, scale=dict(padding=.12)),
+            y=dict(field='row', type='ordinal', axis=None, scale=dict(padding=.12)),
+            tooltip=[dict(field='spectrum', type='ordinal', title='Spectrum'),
+                     dict(field='status', type='nominal', title='상태')]),
+        layer=[dict(mark=dict(type='rect', cursor='pointer'), encoding=dict(
+            color=dict(field='status', type='nominal', title=None,
+                scale=dict(domain=['저장 대상', '제외'], range=['#2878b5', '#d64242']),
+                legend=dict(orient='bottom')),
+            stroke=dict(condition=dict(test='datum.current', value='#f0a000'), value='white'),
+            strokeWidth=dict(condition=dict(test='datum.current', value=3), value=1))),
+            dict(mark=dict(type='text', cursor='pointer', color='white', fontSize=10),
+                 encoding=dict(text=dict(field='spectrum', type='ordinal')))])
+
+
+def _mapping_tab(session, stages):
+    files = [fi for fi, item in enumerate(session.items) if item['kind'] in ('mapping', 'matrix')]
+    if not files:
+        st.info('좌표 mapping 또는 다중 spectrum 파일을 전처리하면 이 탭에서 지점을 클릭할 수 있습니다.')
+        return
+    a, b, c = st.columns([1, 2, 1])
+    stage = a.selectbox('표시 단계', stages, index=len(stages)-1, key='map_view_stage',
+        format_func=lambda v: session.asls_result['params'].method if v == 'AsLS' else v)
+    fi = b.selectbox('Mapping / 다중 spectrum 파일', files, key='map_view_file',
+                     format_func=lambda i: session.items[i]['path'].name)
+    item = session.items[fi]
+    number_key = f'map_view_pixel_{fi}_{len(item["raw"])}'
+    pi = int(c.number_input('Spectrum 번호', min_value=1, max_value=len(item['raw']),
+                            value=1, step=1, key=number_key))-1
+    location, spectrum = st.columns([1, 3], gap='medium')
+    with location:
+        if item['coords'] is not None:
+            x, y = item['coords'][pi]
+            st.caption(f'실제 위치 x={x:g}, y={y:g} · Spectrum {pi+1}')
+            spec = mapping_spec(session, fi, pi)
+        else:
+            first = (pi//100)*100+1
+            st.caption(f'원본 열 순서의 번호표 · {first}–{min(first+99,len(item["raw"]))} / '
+                       f'{len(item["raw"])} spectra')
+            st.caption('번호를 클릭하세요. 공간 좌표는 파일에 없으며, 번호표는 실제 위치 지도가 아닙니다.')
+            spec = index_spec(session, fi, pi)
+        key = f'map_pick_{st.session_state.pre_point_generation}_{fi}_{pi}'
+        st.vega_lite_chart(spec=spec, use_container_width=True, key=key,
+            selection_mode='mapping_pick',
+            on_select=lambda: _mapping_click(key, number_key, len(item['raw'])))
+        st.caption('주황 테두리: 선택 · 파란색: 포함 · 빨간색: 제외')
+    with spectrum:
+        figure = plot_current(core, session, stage, fi, pi)
+        st.pyplot(figure)
+        plt.close(figure)
+    _exclusion_controls(session, fi, pi, key_prefix='map')
+
+
 def set_excluded(session, fi, pi, excluded, restore_file=False):
     """Change export membership only; raw/corrected arrays remain available."""
     if not 0 <= fi < len(session.items) or not 0 <= pi < len(session.items[fi]['raw']):
@@ -165,19 +228,19 @@ def set_excluded(session, fi, pi, excluded, restore_file=False):
         session.excluded_pixels.discard((fi, pi))
 
 
-def _exclusion_controls(session, fi, pi):
+def _exclusion_controls(session, fi, pi, key_prefix='pre'):
     excluded = (fi, pi) in session.excluded_pixels
     removed = sum((fi, i) in session.excluded_pixels for i in range(len(session.items[fi]['raw'])))
     st.caption(f'현재 spectrum: {"제외" if excluded else "저장 대상"} · '
                f'이 파일 {len(session.items[fi]["raw"])-removed:,}개 포함 / {removed:,}개 제외')
     a, b, c = st.columns(3)
-    if a.button('현재 지점 제외', disabled=excluded, key='pre_point_exclude', width='stretch'):
+    if a.button('현재 지점 제외', disabled=excluded, key=f'{key_prefix}_point_exclude', width='stretch'):
         set_excluded(session, fi, pi, True)
         st.rerun()
-    if b.button('현재 지점 복원', disabled=not excluded, key='pre_point_restore', width='stretch'):
+    if b.button('현재 지점 복원', disabled=not excluded, key=f'{key_prefix}_point_restore', width='stretch'):
         set_excluded(session, fi, pi, False)
         st.rerun()
-    if c.button('이 파일 전체 복원', disabled=not removed, key='pre_file_restore', width='stretch'):
+    if c.button('이 파일 전체 복원', disabled=not removed, key=f'{key_prefix}_file_restore', width='stretch'):
         set_excluded(session, fi, pi, False, restore_file=True)
         st.rerun()
 
@@ -188,7 +251,8 @@ def _input_files():
     uploaded = st.file_uploader('Single / Mapping / 다중 spectrum', type=['txt', 'csv', 'dat', 'tsv'],
         accept_multiple_files=True, key=f'pre_upload_{st.session_state.pre_upload_generation}',
         help='2열 single, 좌표가 있는 mapping, 첫 열이 파수축인 다중 spectrum을 함께 넣을 수 있습니다. '
-             '여러 폴더에서 선택 → 목록 추가를 반복하세요. 인코딩·구분자·입력 형식을 자동 판별합니다.')
+             '여러 폴더에서 선택 → 목록 추가를 반복하세요. 상단 메타데이터는 줄 수를 지정하지 않고 '
+             '내용으로 구분합니다. 인코딩·구분자·입력 형식을 자동 판별합니다.')
     if st.button('목록에 추가', disabled=not uploaded, key='pre_add_files', width='stretch'):
         try:
             added, duplicates = store.add(file_pairs(uploaded))
@@ -424,7 +488,8 @@ def render():
         result = session.final_result
         st.caption(f'Final {result["params"].lower:g}–{result["params"].upper:g} cm⁻¹ · '
                    f'{len(result["targets"][0]):,} points · 제외/보호 구간 생략 {result["omitted_points"]:,} points')
-    view, export, log = st.tabs(['처리 결과 확인', 'CSV · ML 내보내기', '처리 기록'])
+    view, mapping, export, log = st.tabs(['처리 결과 확인', 'Mapping 지점 선택',
+                                        'CSV · ML 내보내기', '처리 기록'])
     with view:
         a, b, c = st.columns([1, 2, 1])
         stage = a.selectbox('표시 단계', stages, index=len(stages)-1,
@@ -463,12 +528,16 @@ def render():
             st.pyplot(figure)
             plt.close(figure)
         _exclusion_controls(session, fi, int(pi))
+    with mapping:
+        _mapping_tab(session, stages)
     with export:
         _exports(session, stages)
     with log:
         st.caption(f'{session.kind} · {len(session.items)} files · {core.VERSION}')
         st.dataframe([{'파일': item['path'].name, '자동 판별': format_names[item['kind']],
-                       'Spectra': len(item['raw']), '원본 points': len(item['axis'])}
+                       'Spectra': len(item['raw']), '원본 points': len(item['axis']),
+                       '데이터 시작 행': item.get('data_start_line'),
+                       '상단 metadata 행': len(item.get('leading_metadata', []))}
                       for item in session.items], hide_index=True, width='stretch')
         if st.session_state.messages:
             st.code('\n'.join(st.session_state.messages), language='text')

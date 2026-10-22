@@ -10,7 +10,7 @@ import numpy as np
 from . import nnls_core, svm_core
 from . import preprocess_core
 
-INPUT_PATCH = 'TXT-2.5.4'
+INPUT_PATCH = 'TXT-2.5.6'
 
 
 class UploadStore:
@@ -131,6 +131,8 @@ def make_pool(session, stage):
                       bands=result.get('bands') if stage in ('BLaPE','Final') else None,
                       inputs=[dict(file=item['path'].name, kind=item['kind'],
                                    spectra=len(item['raw']), points=len(item['axis']),
+                                   data_start_line=item.get('data_start_line'),
+                                   leading_metadata=item.get('leading_metadata', []),
                                    coordinates_available=item['coords'] is not None)
                               for item in session.items])
     digest = hashlib.sha256()
