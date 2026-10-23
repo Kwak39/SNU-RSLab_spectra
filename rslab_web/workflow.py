@@ -10,7 +10,8 @@ import numpy as np
 from . import nnls_core, svm_core
 from . import preprocess_core
 
-INPUT_PATCH = 'PIPE-2.6.0'
+INPUT_PATCH = 'PIPE-2.6.1'
+LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 class UploadStore:
@@ -124,9 +125,10 @@ def make_pool(session, stage):
     axis = _readonly(axes[0])
     data = svm_core.Dataset(axis, _readonly(matrix), ids, sources, names, groups)
     blape = session.blape_result if stage in ('BLaPE', 'Final') else None
-    provenance = dict(stage=stage, asls=asdict(session.asls_result['params']),
+    lineage = preprocess_core.stage_lineage(session, stage)
+    provenance = dict(stage=stage, processing_steps=lineage, asls=asdict(session.asls_result['params']),
                       smoothing=asdict(session.smoothing_result['params']) if session.smoothing_result and
-                      stage in ('Smoothing', 'BLaPE', 'Final') else None,
+                      'Smoothing' in lineage else None,
                       range=asdict(session.range_result['params']) if session.range_result and
                       (stage == 'Range' or (blape and blape.get('input_stage') == 'Range')) else None,
                       blape=asdict(blape['params']) if blape else None,

@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
+import subprocess
 import io
 import tempfile
 import zipfile
@@ -15,7 +18,8 @@ from . import workflow
 from .common import file_pairs
 from .workflow import UploadStore, clear_ml, clear_results, make_pool
 
-INPUT_PATCH = 'PIPE-2.6.0'
+INPUT_PATCH = 'PIPE-2.6.1'
+LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def compatible_input_files():
@@ -88,9 +92,7 @@ def make_export_zip(engine, session, include_asls, include_range=False,
 def plot_current(engine, session, stage, file_index, spectrum_index):
     data = session.plot_data(stage, (file_index, spectrum_index))
     count = max(row[0] for row in data['series'])+1
-    # Keep the previous two-/three-panel physical image sizes. Extra enabled
-    # steps share the same maximum width; only raster resolution increases.
-    figure, axes = plt.subplots(1, count, figsize=(4.1 * min(count, 3), 2.9), dpi=300, squeeze=False)
+    figure, axes = plt.subplots(1, count, figsize=(12.3, 2.9), dpi=300, squeeze=False)
     for row, x, y, label in data['series']:
         display_label = label.replace('Savitzky-Golay', 'SG').replace('Final (uniform grid)', 'Final')
         axes[0, row].plot(x, y, lw=.9, label=display_label)
@@ -133,11 +135,10 @@ def _smoothing_preview(session, settings):
         return
     figure, axes = plt.subplots(1, 2, figsize=(8.2, 2.9), dpi=300)
     axis = item['axis']
-    axes[0].plot(axis, before, lw=.8, alpha=.65, label='Before SG')
-    axes[0].plot(axis, after, lw=1, label=f'SG w={window}, n={order}')
-    axes[0].set_title('SG before / after', fontsize=9)
-    axes[1].plot(axis, before-after, lw=.8, label='Before - after')
-    axes[1].set_title('Removed component', fontsize=9)
+    axes[0].plot(axis, before, lw=.8, label='Before SG')
+    axes[0].set_title('Before SG', fontsize=9)
+    axes[1].plot(axis, after, lw=1, label=f'SG w={window}, n={order}')
+    axes[1].set_title('SG preview', fontsize=9)
     for ax in axes:
         ax.set(xlabel='Raman shift (cm$^{-1}$)', ylabel='Intensity'); ax.legend(fontsize=7)
     figure.tight_layout()
@@ -370,10 +371,14 @@ def _settings():
                 disabled=not sg_enabled, key='pre_sg_window', help='3 이상의 홀수. 입력 구간의 point 수 이하여야 합니다.')
             sg_order = b.number_input('Polynomial order (n)', min_value=0, value=3, step=1,
                 disabled=not sg_enabled, key='pre_sg_order', help='다항식 차수. Window보다 작아야 합니다.')
-            st.caption('Baseline 후 → SG smoothing → BLaPE. 원본 파수·point 유지.')
+            st.caption('독립된 SG 결과로 확인·CSV 저장·ML 전달 가능. 원본 파수·point 유지. BLaPE를 끄고 SG만 실행할 수도 있습니다.')
         with blape:
             st.markdown('**4 · BLaPE**')
             enabled = st.checkbox('BLaPE 실행', True, key='pre_use_blape')
+            blape_use_sg = st.checkbox('BLaPE 입력에 SG 결과 사용', False,
+                disabled=not (enabled and sg_enabled), key='pre_blape_use_sg',
+                help='기본 입력은 Baseline 결과입니다. Baseline OFF이면 Raw를 사용합니다. '
+                     '이 옵션을 켜면 별도로 계산된 Smoothing 결과를 사용합니다.')
             a, b, c = st.columns(3)
             sigma = a.number_input('σ (points)', min_value=.01, value=30., step=1.,
                                    disabled=not enabled, key='pre_sigma')
@@ -405,7 +410,8 @@ def _settings():
                 niter=int(niter), anomaly=anomaly, window=int(window), threshold=threshold,
                 enabled=enabled, sigma=sigma, eps=eps, edge=int(edge), exclusions=exclusion_text,
                 margin=margin, use_final=use_final, lower=lower, upper=upper,
-                sg_enabled=sg_enabled, sg_window=int(sg_window), sg_order=int(sg_order))
+                sg_enabled=sg_enabled, blape_use_sg=bool(sg_enabled and blape_use_sg),
+                sg_window=int(sg_window), sg_order=int(sg_order))
 
 
 def _run(settings):
@@ -422,7 +428,7 @@ def _run(settings):
         blape = core.BLaPESettings(sigma=float(settings['sigma']), eps=float(settings['eps']),
             edge_trim=settings['edge'], target_points=None,
             exclude_ranges=core.parse_exclusions(settings['exclusions']) if settings['enabled'] else (),
-            exclusion_margin=float(settings['margin']), sg_enabled=settings['sg_enabled'],
+            exclusion_margin=float(settings['margin']), sg_enabled=settings['blape_use_sg'],
             sg_window=settings['sg_window'], sg_order=settings['sg_order'])
         input_settings = core.InputSettings()
         load_token = (INPUT_PATCH, core.VERSION, store.revision, input_settings)
@@ -453,7 +459,7 @@ def _run(settings):
                 session.blape_result = session.final_result = None
             if settings['enabled']:
                 if (session.blape_result is None or session.blape_result['params'] != blape
-                        or session.blape_result['input_stage'] != ('Smoothing' if settings['sg_enabled'] else 'AsLS')):
+                        or session.blape_result['input_stage'] != ('Smoothing' if settings['blape_use_sg'] else 'AsLS')):
                     session.run_blape(blape, emit=emit, use_range=False)
                 else:
                     logs.append('BLaPE: 동일 조건의 결과 재사용')
@@ -490,47 +496,139 @@ def _exports(session, stages):
         st.warning('모든 spectrum이 제외되었습니다. 처리 결과 확인에서 저장할 지점을 복원하세요.')
     if stages == ['Raw']:
         st.info('저장할 처리 단계가 꺼져 있습니다. 원하는 단계를 켜고 전처리를 실행하세요. Raw는 ML로 전달할 수 있습니다.')
-    left, right = st.columns(2, gap='large')
-    with left:
-        st.markdown('**CSV ZIP**')
+    st.caption('각 행의 CSV와 ML은 해당 단계의 결과만 사용합니다. ML 공용 풀에는 마지막으로 보낸 단계가 들어갑니다.')
+    snapshot = export_snapshot(session)
+    for stage in stages:
+        title, csv_col, ml_col = st.columns([2, 1, 1], vertical_alignment='center')
+        title.markdown(f'**{names[stage]}**')
+        if stage != 'Raw':
+            selection = {f'include_{key}': stage == label for key, label in
+                         [('asls', 'AsLS'), ('smoothing', 'Smoothing'), ('blape', 'BLaPE'), ('final', 'Final')]}
+            csv_col.download_button('CSV 다운로드',
+                data=lambda selection=selection: make_export_zip(core, snapshot, **selection),
+                file_name=f'RSLab_{stage}_CSV.zip', mime='application/zip',
+                disabled=not kept, on_click='ignore', key=f'pre_download_{stage}', width='stretch')
+        if ml_col.button('ML로 보내기', key=f'bridge_send_{stage}', disabled=not kept, width='stretch'):
+            _send_to_ml(session, stage, names[stage], token)
+    with st.expander('여러 단계 CSV를 하나의 ZIP으로 저장'):
         cols = st.columns(4)
         choices = [cols[i].checkbox(names[stage], value=True, key=f'pre_export_{stage}')
                    if stage in stages else False for i, stage in enumerate(('AsLS', 'Smoothing', 'BLaPE', 'Final'))]
-        snapshot = export_snapshot(session)
         selection = tuple(choices)
-        st.download_button('ZIP 만들기 · 다운로드',
+        st.download_button('선택 단계 ZIP 다운로드',
             data=lambda: make_export_zip(core, snapshot, selection[0], False, selection[2], selection[3], selection[1]),
             file_name='RSLab_Spectra_results.zip', mime='application/zip',
             disabled=not any(choices) or not kept, on_click='ignore', key='pre_download', width='stretch')
-    with right:
-        st.markdown('**ML 공용 데이터로 전달**')
-        stage = st.selectbox('전달 단계', stages, index=len(stages)-1,
-                             format_func=lambda value: names[value], key='bridge_stage')
-        if st.button('ML로 보내기', key='bridge_send', disabled=not kept, width='stretch'):
-            try:
-                pool = make_pool(session, stage)
-                if st.session_state.get('ml_pool') is None or st.session_state.ml_pool.signature != pool.signature:
-                    st.session_state.ml_pool = pool
-                    for tool in ('svm', 'knn', 'nnls'):
-                        st.session_state.pop(f'{tool}_pool_assignments', None)
-                        clear_results(st.session_state, tool)
-                for tool in ('svm', 'knn', 'nnls'):
-                    st.session_state[f'{tool}_input_mode'] = '전처리 데이터'
-                st.session_state.pre_bridge_token = token
-                st.session_state.pre_bridge_exclusions = frozenset(session.excluded_pixels)
-                st.success(f'{names[stage]} · {len(pool.data.X):,} spectra 전달. ML 탭에서 Label/TRAIN/TEST를 지정하세요.')
-            except Exception as exc:
-                st.error(str(exc))
+    if st.session_state.get('pre_bridge_stage'):
+        st.caption(f'마지막 ML 전달: {st.session_state.pre_bridge_stage} · '
+                   f'{st.session_state.get("pre_bridge_count", 0):,} spectra')
+
+
+def _send_to_ml(session, stage, name, token):
+    try:
+        pool = make_pool(session, stage)
+        if st.session_state.get('ml_pool') is None or st.session_state.ml_pool.signature != pool.signature:
+            st.session_state.ml_pool = pool
+            for tool in ('svm', 'knn', 'nnls'):
+                st.session_state.pop(f'{tool}_pool_assignments', None)
+                clear_results(st.session_state, tool)
+        for tool in ('svm', 'knn', 'nnls'):
+            st.session_state[f'{tool}_input_mode'] = '전처리 데이터'
+        st.session_state.pre_bridge_token = token
+        st.session_state.pre_bridge_exclusions = frozenset(session.excluded_pixels)
+        st.session_state.pre_bridge_stage = name
+        st.session_state.pre_bridge_count = len(pool.data.X)
+        st.success(f'{name} · {len(pool.data.X):,} spectra 전달. ML 탭에서 Label/TRAIN/TEST를 지정하세요.')
+    except Exception as exc:
+        st.error(str(exc))
+
+
+def deployment_status():
+    """Compare shipped release, on-disk files and modules actually imported.
+
+    No remote GitHub request: this checks the checkout serving this app.
+    Import-time fingerprints stay fixed until the Python modules restart.
+    """
+    folder = Path(__file__).resolve().parent
+    try:
+        manifest = json.loads((folder / 'build_manifest.json').read_text(encoding='utf-8'))
+        expected = manifest['sha256']
+        if not isinstance(expected, dict):
+            raise ValueError('Invalid sha256 record')
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return dict(ok=False, release=INPUT_PATCH, rows=[], error=f'배포 확인 파일을 읽을 수 없습니다: {exc}')
+    rows = []
+    for module in (core, workflow):
+        path = Path(module.__file__).resolve()
+        rows.append(_file_status(path, getattr(module, 'INPUT_PATCH', ''),
+                                 getattr(module, 'LOADED_SOURCE_SHA256', ''), expected))
+    rows.append(_file_status(Path(__file__).resolve(), INPUT_PATCH, LOADED_SOURCE_SHA256, expected))
+    ok = (manifest.get('release') == INPUT_PATCH and compatible_input_files()
+          and all(row['일치'] for row in rows))
+    return dict(ok=ok, release=manifest.get('release', 'unknown'), rows=rows,
+                built_at=manifest.get('built_at_utc', ''), error='')
+
+
+def _file_status(path, version, loaded_hash, expected):
+    try:
+        disk_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        disk_hash = ''
+    wanted = expected.get(path.name, '')
+    return {'파일': path.name, '실행 버전': version,
+            '기대 SHA256': wanted, '실행 SHA256': loaded_hash, '디스크 SHA256': disk_hash,
+            '일치': bool(wanted and wanted == loaded_hash == disk_hash), '실제 경로': str(path)}
+
+
+def _deployment_banner():
+    status = deployment_status()
+    if status['ok']:
+        st.success(f"적용 확인 · {INPUT_PATCH} · 실행 코드와 배포 파일 3개 일치")
+    else:
+        st.warning(f"적용 확인 필요 · 실행 {INPUT_PATCH} / 배포 {status['release']}. "
+                   '파일 누락·버전 혼합·재시작 필요 여부를 아래에서 확인하세요.')
+    with st.expander('배포 적용 상태 · 파일 확인'):
+        st.caption(f"실행 중인 입력 기능: {INPUT_PATCH} · 배포 묶음: {status['release']}")
+        commit = checkout_commit()
+        st.caption(f'서버 checkout 커밋: {commit or "이 환경에서 확인할 수 없음"}')
+        st.caption('커밋이 표시되면 GitHub의 해당 브랜치 최신 커밋과 비교할 수 있습니다. '
+                   '파일 일치 표는 이번 패치의 입력·전처리·ML 전달 코드 3개를 검사합니다.')
+        if status.get('built_at'):
+            st.caption(f"패치 제작 시각 (UTC): {status['built_at']} · 앱 업데이트 시각을 뜻하지 않습니다.")
+        if status['error']:
+            st.warning(status['error'])
+        if status['rows']:
+            st.dataframe(status['rows'], hide_index=True, width='stretch')
+        st.caption('기대값과 디스크가 다르면 이 ZIP의 4개 파일을 같은 위치에 올리세요. '
+                   '디스크와 실행값이 다르면 Streamlit Cloud의 Manage app → Reboot app으로 재시작하세요. '
+                   '이 표는 현재 서버의 파일을 확인하며, GitHub 최신 커밋을 직접 조회하지 않습니다.')
+        st.caption('이 안내 자체가 보이지 않으면 이전 앱이 실행 중입니다. 배포 대상 저장소·브랜치·메인 파일 경로를 확인하세요.')
+        if st.button('적용 상태 다시 확인', key='pre_check_build'):
+            st.rerun()
+
+
+def checkout_commit():
+    """Read this server's checkout only; never contact a GitHub remote."""
+    try:
+        result = subprocess.run(['git', '-C', str(Path(__file__).resolve().parents[1]),
+                                 'rev-parse', '--short=12', 'HEAD'],
+                                capture_output=True, text=True, timeout=2, check=False)
+        value = result.stdout.strip()
+        return value if result.returncode == 0 and 7 <= len(value) <= 40 and all(
+            c in '0123456789abcdef' for c in value) else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
 
 
 def render():
-    st.caption(f'입력 패치 {INPUT_PATCH}')
+    _deployment_banner()
     if not compatible_input_files():
         st.error('입력 패치의 파일 버전이 일치하지 않습니다. rslab_web 폴더의 preprocess_core.py, '
                  'preprocess_ui.py, workflow.py를 같은 ZIP의 파일로 교체한 뒤 앱을 재시작하세요.')
         return
     init_state()
-    st.caption('파일 누적 → AsLS / arPLS → Savitzky–Golay (선택) → 원본 축 BLaPE → Final 공통축 → ML')
+    st.caption('Baseline · SG · BLaPE · Final 결과를 따로 확인·내보내기합니다. '
+               'BLaPE는 기본으로 Baseline/Raw를 사용하며, SG 결과 사용은 별도로 선택합니다.')
     settings = _settings()
     pending_sg = st.session_state.pop('pre_sg_apply_pending', False)
     if settings['run'] or pending_sg:

@@ -2,6 +2,7 @@
 Numerical/export code shared with RSLab_Spectra_Unified_v2_4_0.py.
 """
 import csv
+import hashlib
 import gc
 import json
 import math
@@ -24,8 +25,9 @@ from scipy.linalg import solveh_banded
 from scipy.special import expit
 from scipy.signal import savgol_filter
 
-INPUT_PATCH = 'PIPE-2.6.0'
-VERSION = '2.6.0 independent Baseline / Smoothing / BLaPE / Final'
+INPUT_PATCH = 'PIPE-2.6.1'
+LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+VERSION = '2.6.1 separate stage views and verified deployment'
 
 @dataclass(frozen=True)
 class InputSettings:
@@ -925,51 +927,33 @@ class SpectraSession:
         return selected
 
     def plot_data(self, stage, selected, cancel=None):
+        """One selected processing result per figure; never mix upstream curves."""
         checkpoint(cancel)
-        fi, pi = selected; item = self.items[fi]; axis = item['axis']; raw = item['raw'][pi]
-        series = [(0, axis, raw, 'Raw')]; titles = ['Raw']; panel = 0
-        if stage == 'Raw':
-            return dict(series=series, panel_titles=titles, stage=stage,
-                        label=self.label(selected), excluded_ranges=[])
-        if self.asls_result is None:
-            raise ValueError('먼저 입력 데이터를 처리하세요.')
-        cfg = self.asls_result['params']; corrected = self.asls_result['arrays'][fi][pi]
-        if cfg.enabled:
-            clean = anomaly_impute(raw, cfg.anomaly_window, cfg.anomaly_threshold) if cfg.anomaly else raw
-            series.append((0, axis, clean-corrected, f'{cfg.method} baseline'))
-            panel += 1; titles.append(f'Baseline ({cfg.method})')
-            series.append((panel, axis, corrected, f'{cfg.method} corrected'))
-        if stage == 'Range':
-            if self.range_result is None: raise ValueError('Range 결과가 없습니다.')
-            panel += 1; titles.append('Range')
-            series.append((panel, self.range_result['targets'][fi], self.range_result['arrays'][fi][pi], 'Range'))
-        include_sg = stage in ('Smoothing', 'BLaPE', 'Final') and self.smoothing_result is not None
-        if stage in ('BLaPE', 'Final') and self.blape_result is not None:
-            include_sg = self.blape_result['input_stage'] == 'Smoothing'
-        if include_sg:
-            result = self.smoothing_result; p = result['params']
-            panel += 1; titles.append('SG smoothing')
-            series += [(panel, axis, corrected, 'Before SG'),
-                       (panel, axis, result['arrays'][fi][pi],
-                        f'Savitzky-Golay (w={p.window_length}, n={p.polyorder})')]
-        elif stage == 'Smoothing':
-            raise ValueError('Smoothing 결과가 없습니다.')
-        if stage in ('BLaPE', 'Final') and self.blape_result is not None:
-            result = self.blape_result; panel += 1; titles.append('BLaPE')
-            x, y = drawing_axis(result['targets'][fi], result['arrays'][fi][pi], bands_for(result, fi))
-            series.append((panel, x, y, result.get('method', 'BLaPE')))
-        elif stage == 'BLaPE':
-            raise ValueError('BLaPE 결과가 없습니다.')
-        if stage == 'Final':
-            if self.final_result is None: raise ValueError('Final 결과가 없습니다.')
-            result = self.final_result; panel += 1; titles.append('Final')
-            x, y = drawing_axis(result['targets'][fi], result['arrays'][fi][pi], bands_for(result, fi))
-            series.append((panel, x, y, 'Final (uniform grid)'))
+        fi, pi = selected
+        item = self.items[fi]
         excluded = []
-        if stage in ('BLaPE', 'Final') and self.blape_result is not None:
-            p = self.blape_result['params']
-            excluded = [(lo-p.exclusion_margin, hi+p.exclusion_margin) for lo, hi in p.exclude_ranges]
-        return dict(series=series, panel_titles=titles, stage=stage,
+        if stage == 'Raw':
+            x, y, title = item['axis'], item['raw'][pi], 'Raw'
+        else:
+            result = {'AsLS': self.asls_result, 'Smoothing': self.smoothing_result,
+                      'Range': self.range_result, 'BLaPE': self.blape_result,
+                      'Final': self.final_result}.get(stage)
+            if result is None:
+                raise ValueError(f'{stage} 결과가 없습니다.')
+            if stage == 'AsLS' and not result['params'].enabled:
+                raise ValueError('Baseline correction이 꺼져 있습니다.')
+            title = f"Baseline ({result['params'].method})" if stage == 'AsLS' else stage
+            if stage == 'Smoothing':
+                p = result['params']
+                title = f'SG smoothing (w={p.window_length}, n={p.polyorder})'
+            if stage in ('AsLS', 'Smoothing'):
+                x, y = item['axis'], result['arrays'][fi][pi]
+            else:
+                x, y = drawing_axis(result['targets'][fi], result['arrays'][fi][pi], bands_for(result, fi))
+            if stage in ('BLaPE', 'Final') and self.blape_result is not None:
+                p = self.blape_result['params']
+                excluded = [(lo-p.exclusion_margin, hi+p.exclusion_margin) for lo, hi in p.exclude_ranges]
+        return dict(series=[(0, x, y, title)], panel_titles=[title], stage=stage,
                     label=self.label(selected), excluded_ranges=excluded)
 
     def label(self, selected):
@@ -1035,6 +1019,20 @@ class SpectraSession:
         return save_session(self, choice, output_root, emit, cancel)
 
 # %% 6. CSV 저장 — AsLS / BLaPE / Both, 계산/그림과 독립
+
+def stage_lineage(session, stage):
+    """Actual ancestors of a result, including optional independent SG input."""
+    if stage == 'Raw':
+        return ['Raw']
+    if stage == 'AsLS':
+        return ['Raw', 'AsLS'] if session.asls_result['params'].enabled else ['Raw']
+    if stage in ('Smoothing', 'Range'):
+        return stage_lineage(session, 'AsLS') + [stage]
+    if stage in ('BLaPE', 'Final'):
+        result = session.blape_result if stage == 'BLaPE' else session.final_result
+        return stage_lineage(session, result['input_stage']) + [stage]
+    raise ValueError(f'Unknown stage: {stage}')
+
 
 def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None):
     if choice not in ('AsLS', 'Smoothing', 'Range', 'BLaPE', 'Final', 'Both', 'All'):
@@ -1115,16 +1113,13 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
                         final_bands=session.final_result['bands'],
                         final_omitted_points=session.final_result['omitted_points'],
                         final_rule='Linear interpolation of last enabled stage; inclusive fixed grid; no extrapolation or interpolation across gaps; no renormalization')
-    active = []
-    if session.asls_result['params'].enabled:
-        active.append(session.asls_result['params'].method)
-    if session.smoothing_result is not None:
-        active.append('Savitzky-Golay')
-    if session.blape_result is not None:
-        active.append('native Gaussian/BLaPE + edge trim')
-    if session.final_result is not None:
-        active.append('Final crop/interpolation')
-    metadata['processing_order'] = ' -> '.join(active) or 'Raw'
+    names = dict(Raw='Raw', AsLS=session.asls_result['params'].method,
+                 Smoothing='Savitzky-Golay', Range='Range',
+                 BLaPE='native Gaussian/BLaPE + edge trim', Final='Final crop/interpolation')
+    paths = {stage: stage_lineage(session, stage) for stage in stages}
+    metadata['processing_steps_by_stage'] = paths
+    metadata['processing_order'] = ' | '.join(
+        f'{stage}: ' + ' -> '.join(names[v] for v in lineage) for stage, lineage in paths.items())
     metadata['enabled_steps'] = dict(baseline=session.asls_result['params'].enabled,
         smoothing=session.smoothing_result is not None, blape=session.blape_result is not None,
         final=session.final_result is not None)
