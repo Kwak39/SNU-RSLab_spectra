@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import json
 import subprocess
@@ -15,16 +16,19 @@ import streamlit as st
 
 from . import preprocess_core as core
 from . import workflow
+from . import blank_gate_core as gate, blank_gate_ui, ml_ui
 from .common import file_pairs
 from .workflow import UploadStore, clear_ml, clear_results, make_pool
 
-INPUT_PATCH = 'PIPE-2.6.2'
+INPUT_PATCH = 'GATE-2.7.0'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def compatible_input_files():
     return (getattr(core, 'INPUT_PATCH', None) == INPUT_PATCH
-            and getattr(workflow, 'INPUT_PATCH', None) == INPUT_PATCH)
+            and getattr(workflow, 'INPUT_PATCH', None) == INPUT_PATCH
+            and gate.INPUT_PATCH == INPUT_PATCH and blank_gate_ui.INPUT_PATCH == INPUT_PATCH
+            and ml_ui.INPUT_PATCH == INPUT_PATCH)
 
 
 def load_core():
@@ -71,9 +75,9 @@ def export_snapshot(session):
 
 
 def make_export_zip(engine, session, include_asls, include_range=False,
-                    include_blape=False, include_final=False, include_smoothing=False):
+                    include_blape=False, include_final=False, include_smoothing=False, include_raw=False):
     """Pure download worker: no Streamlit/session-state access or shared folders."""
-    stages = [name for name, selected in [('AsLS', include_asls), ('Smoothing', include_smoothing), ('Range', include_range),
+    stages = [name for name, selected in [('Raw', include_raw), ('AsLS', include_asls), ('Smoothing', include_smoothing), ('Range', include_range),
               ('BLaPE', include_blape), ('Final', include_final)] if selected]
     if not stages:
         raise ValueError('내보낼 처리 단계를 선택하세요.')
@@ -82,6 +86,11 @@ def make_export_zip(engine, session, include_asls, include_range=False,
         root = Path(temp)
         for stage in stages:
             session.save(stage, root)
+        report = getattr(session, 'blank_gate_report', None)
+        if report:
+            with (root/'blank_gate_review.csv').open('w', encoding='utf-8-sig', newline='') as stream:
+                writer = csv.DictWriter(stream, fieldnames=list(report[0]))
+                writer.writeheader(); writer.writerows(report)
         with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(root.rglob('*')):
                 if path.is_file():
@@ -209,7 +218,7 @@ def _result_overview(session, settings):
             st.vega_lite_chart(spec=spec, use_container_width=True, key=key,
                 selection_mode='mapping_pick',
                 on_select=lambda: _mapping_click(key, number_key, len(item['raw'])))
-            st.caption('클릭하면 모든 단계가 같은 spectrum으로 바뀝니다. 주황: 선택 · 파랑: 포함 · 빨강: 제외')
+            st.caption('클릭하면 모든 단계가 같은 spectrum으로 바뀝니다. 주황 테두리: 선택 · 파랑: 포함 · 빨강: 수동 제외 · 노랑: 후보 · 회색: 확정 blank')
         with plots:
             preview = _smoothing_preview(session, settings, fi, pi)
             _show_pipeline(session, fi, pi, preview)
@@ -264,10 +273,20 @@ def _mapping_click(chart_key, number_key, count):
         st.session_state[number_key] = number
 
 
+def point_statuses(session, fi):
+    chosen = gate.confirmed(session)
+    result = gate.current_result(session) if gate.gate_state(session).get('enabled') else None
+    candidates = {(r['fi'], r['pi']) for r in result['records'] if r['candidate']} if result else set()
+    return ['제외' if (fi, pi) in session.excluded_pixels else '확정 blank' if (fi, pi) in chosen
+            else 'blank 후보' if (fi, pi) in candidates else '저장 대상'
+            for pi in range(len(session.items[fi]['raw']))]
+
+
 def mapping_spec(session, fi, pi):
     item = session.items[fi]
+    status = point_statuses(session, fi)
     rows = [dict(spectrum=i+1, x=float(x), y=float(y),
-                 status='제외' if (fi, i) in session.excluded_pixels else '저장 대상',
+                 status=status[i],
                  current=i == pi)
             for i, (x, y) in enumerate(item['coords'])]
     return dict(data=dict(values=rows), height=250,
@@ -278,7 +297,7 @@ def mapping_spec(session, fi, pi):
             x=dict(field='x', type='quantitative', title='x position', scale=dict(zero=False)),
             y=dict(field='y', type='quantitative', title='y position', scale=dict(zero=False, reverse=True)),
             color=dict(field='status', type='nominal', title=None,
-                       scale=dict(domain=['저장 대상', '제외'], range=['#2878b5', '#d64242']),
+                       scale=dict(domain=['저장 대상', '제외', 'blank 후보', '확정 blank'], range=['#2878b5', '#d64242', '#b78b20', '#777777']),
                        legend=dict(orient='bottom')),
             size=dict(condition=dict(test='datum.current', value=220), value=90),
             stroke=dict(condition=dict(test='datum.current', value='#f0a000'), value='white'),
@@ -292,8 +311,9 @@ def index_spec(session, fi, pi):
     """Numbered tiles follow column order; they carry no spatial coordinates."""
     start = (pi // 100) * 100
     stop = min(start+100, len(session.items[fi]['raw']))
+    status = point_statuses(session, fi)
     rows = [dict(spectrum=i+1, column=(i-start) % 10, row=(i-start) // 10,
-                 status='제외' if (fi, i) in session.excluded_pixels else '저장 대상',
+                 status=status[i],
                  current=i == pi) for i in range(start, stop)]
     return dict(data=dict(values=rows), height=max(110, ((stop-start+9)//10)*28),
         params=[dict(name='mapping_pick', select=dict(type='point', fields=['spectrum'],
@@ -305,7 +325,7 @@ def index_spec(session, fi, pi):
                      dict(field='status', type='nominal', title='상태')]),
         layer=[dict(mark=dict(type='rect', cursor='pointer'), encoding=dict(
             color=dict(field='status', type='nominal', title=None,
-                scale=dict(domain=['저장 대상', '제외'], range=['#2878b5', '#d64242']),
+                scale=dict(domain=['저장 대상', '제외', 'blank 후보', '확정 blank'], range=['#2878b5', '#d64242', '#b78b20', '#777777']),
                 legend=dict(orient='bottom')),
             stroke=dict(condition=dict(test='datum.current', value='#f0a000'), value='white'),
             strokeWidth=dict(condition=dict(test='datum.current', value=3), value=1))),
@@ -533,48 +553,66 @@ def _run(settings):
 
 
 def _exports(session, stages):
-    names = {'Raw': 'Raw', 'AsLS': f'Baseline ({session.asls_result["params"].method})',
+    names = {'Raw': 'Raw (원본)', 'AsLS': f'Baseline ({session.asls_result["params"].method})',
              'Smoothing': 'Smoothing (SG)', 'BLaPE': 'BLaPE', 'Final': 'Final'}
+    state = gate.gate_state(session)
     total = sum(len(item['raw']) for item in session.items)
-    kept = total - len(session.excluded_pixels)
-    st.caption(f'저장·다음 ML 전달 대상 {kept:,} / {total:,} spectra · 제외 {total-kept:,}개')
+    st.caption(f'전체 {total:,} · 확정 blank {len(gate.confirmed(session)):,} · 수동 제외 {len(session.excluded_pixels):,}')
+    if not state.get('enabled'):
+        st.caption('Blank-gate OFF. 제외 선택 시 수동 지점 제외만 적용합니다.')
+    a, b = st.columns(2)
+    labels = {'exclude_confirmed': '확정 blank 제외 · 수동 제외 반영', 'all': '전체 포함 · blank/수동 제외도 모두 포함'}
+    csv_policy = a.radio('CSV 포함 범위', list(labels), format_func=lambda key: labels[key], key='bg_csv_policy')
+    ml_policy = b.radio('ML 포함 범위', list(labels), format_func=lambda key: labels[key], key='bg_ml_policy')
+    st.caption('포함 범위와 처리 단계는 별개입니다. 원본 전체 CSV는 전체 포함 + Raw를 선택하세요. '
+               'ML 공용 풀에는 마지막으로 보낸 결과가 들어갑니다.')
+    snapshots = {}
+    for role, policy in [('CSV', csv_policy), ('ML', ml_policy)]:
+        try:
+            snapshots[role] = gate.export_session(session, policy)
+        except ValueError as exc:
+            st.info(f'{role}: {exc}')
+            snapshots[role] = None
     token = (st.session_state.pre_point_generation, id(session))
-    if (st.session_state.get('pre_bridge_token') == token and
-            st.session_state.get('pre_bridge_exclusions') != frozenset(session.excluded_pixels)):
-        st.warning('ML 전달 후 제외 목록이 변경되었습니다. ML로 보내기를 다시 눌러 반영하세요.')
-    if not kept:
-        st.warning('모든 spectrum이 제외되었습니다. 처리 결과 확인에서 저장할 지점을 복원하세요.')
-    if stages == ['Raw']:
-        st.info('저장할 처리 단계가 꺼져 있습니다. 원하는 단계를 켜고 전처리를 실행하세요. Raw는 ML로 전달할 수 있습니다.')
-    st.caption('각 행의 CSV와 ML은 해당 단계의 결과만 사용합니다. ML 공용 풀에는 마지막으로 보낸 단계가 들어갑니다.')
-    snapshot = export_snapshot(session)
-    for stage in stages:
+    if st.session_state.get('pre_bridge_token') == token:
+        old = st.session_state.get('ml_pool')
+        old_gate = old.provenance.get('blank_gate') if old else None
+        old_exclusions = st.session_state.get('pre_bridge_exclusions')
+        if old_gate and (old_gate['state_signature'] != gate.state_signature(session) or
+                         old_gate['policy'] != ml_policy or old_exclusions != frozenset(session.excluded_pixels)):
+            st.warning('Blank 판정/포함 범위/수동 제외가 ML 전달 후 변경되었습니다. ML로 보내기를 다시 눌러 반영하세요.')
+    csv_snapshot, ml_snapshot = snapshots['CSV'], snapshots['ML']
+    csv_kept = total-len(csv_snapshot.excluded_pixels) if csv_snapshot else 0
+    ml_kept = total-len(ml_snapshot.excluded_pixels) if ml_snapshot else 0
+    st.caption(f'현재 선택 기준 CSV {csv_kept:,} / ML {ml_kept:,} spectra')
+    export_stages = ['Raw']+[stage for stage in stages if stage != 'Raw']
+    for stage in export_stages:
         title, csv_col, ml_col = st.columns([2, 1, 1], vertical_alignment='center')
         title.markdown(f'**{names[stage]}**')
-        if stage != 'Raw':
-            selection = {f'include_{key}': stage == label for key, label in
-                         [('asls', 'AsLS'), ('smoothing', 'Smoothing'), ('blape', 'BLaPE'), ('final', 'Final')]}
-            csv_col.download_button('CSV 다운로드',
-                data=lambda selection=selection: make_export_zip(core, snapshot, **selection),
-                file_name=f'RSLab_{stage}_CSV.zip', mime='application/zip',
-                disabled=not kept, on_click='ignore', key=f'pre_download_{stage}', width='stretch')
-        if ml_col.button('ML로 보내기', key=f'bridge_send_{stage}', disabled=not kept, width='stretch'):
-            _send_to_ml(session, stage, names[stage], token)
+        selection = {f'include_{key}': stage == label for key, label in
+                     [('raw', 'Raw'), ('asls', 'AsLS'), ('smoothing', 'Smoothing'), ('blape', 'BLaPE'), ('final', 'Final')]}
+        csv_col.download_button('CSV 다운로드',
+            data=lambda selection=selection, snapshot=csv_snapshot: make_export_zip(core, snapshot, **selection),
+            file_name=f'RSLab_{stage}_{csv_policy}_CSV.zip', mime='application/zip',
+            disabled=not csv_kept, on_click='ignore', key=f'pre_download_{stage}', width='stretch')
+        if ml_col.button('ML로 보내기', key=f'bridge_send_{stage}', disabled=not ml_kept, width='stretch'):
+            _send_to_ml(ml_snapshot, stage, names[stage], token,
+                        manual_exclusions=frozenset(session.excluded_pixels))
     with st.expander('여러 단계 CSV를 하나의 ZIP으로 저장'):
-        cols = st.columns(4)
-        choices = [cols[i].checkbox(names[stage], value=True, key=f'pre_export_{stage}')
-                   if stage in stages else False for i, stage in enumerate(('AsLS', 'Smoothing', 'BLaPE', 'Final'))]
+        cols = st.columns(5)
+        choices = [cols[i].checkbox(names[stage], value=stage != 'Raw', key=f'pre_export_{stage}')
+                   if stage in export_stages else False for i, stage in enumerate(('Raw', 'AsLS', 'Smoothing', 'BLaPE', 'Final'))]
         selection = tuple(choices)
         st.download_button('선택 단계 ZIP 다운로드',
-            data=lambda: make_export_zip(core, snapshot, selection[0], False, selection[2], selection[3], selection[1]),
+            data=lambda: make_export_zip(core, csv_snapshot, selection[1], False, selection[3], selection[4], selection[2], selection[0]),
             file_name='RSLab_Spectra_results.zip', mime='application/zip',
-            disabled=not any(choices) or not kept, on_click='ignore', key='pre_download', width='stretch')
+            disabled=not any(choices) or not csv_kept, on_click='ignore', key='pre_download', width='stretch')
     if st.session_state.get('pre_bridge_stage'):
         st.caption(f'마지막 ML 전달: {st.session_state.pre_bridge_stage} · '
                    f'{st.session_state.get("pre_bridge_count", 0):,} spectra')
 
 
-def _send_to_ml(session, stage, name, token):
+def _send_to_ml(session, stage, name, token, manual_exclusions=None):
     try:
         pool = make_pool(session, stage)
         if st.session_state.get('ml_pool') is None or st.session_state.ml_pool.signature != pool.signature:
@@ -585,7 +623,7 @@ def _send_to_ml(session, stage, name, token):
         for tool in ('svm', 'knn', 'nnls'):
             st.session_state[f'{tool}_input_mode'] = '전처리 데이터'
         st.session_state.pre_bridge_token = token
-        st.session_state.pre_bridge_exclusions = frozenset(session.excluded_pixels)
+        st.session_state.pre_bridge_exclusions = (frozenset(session.excluded_pixels) if manual_exclusions is None else manual_exclusions)
         st.session_state.pre_bridge_stage = name
         st.session_state.pre_bridge_count = len(pool.data.X)
         st.success(f'{name} · {len(pool.data.X):,} spectra 전달. ML 탭에서 Label/TRAIN/TEST를 지정하세요.')
@@ -608,7 +646,7 @@ def deployment_status():
     except (OSError, ValueError, KeyError, TypeError) as exc:
         return dict(ok=False, release=INPUT_PATCH, rows=[], error=f'배포 확인 파일을 읽을 수 없습니다: {exc}')
     rows = []
-    for module in (core, workflow):
+    for module in (core, workflow, gate, blank_gate_ui, ml_ui):
         path = Path(module.__file__).resolve()
         rows.append(_file_status(path, getattr(module, 'INPUT_PATCH', ''),
                                  getattr(module, 'LOADED_SOURCE_SHA256', ''), expected))
@@ -633,7 +671,7 @@ def _file_status(path, version, loaded_hash, expected):
 def _deployment_banner():
     status = deployment_status()
     if status['ok']:
-        st.success(f"적용 확인 · {INPUT_PATCH} · 실행 코드와 배포 파일 3개 일치")
+        st.success(f"적용 확인 · {INPUT_PATCH} · 실행 코드와 배포 파일 6개 일치")
     else:
         st.warning(f"적용 확인 필요 · 실행 {INPUT_PATCH} / 배포 {status['release']}. "
                    '파일 누락·버전 혼합·재시작 필요 여부를 아래에서 확인하세요.')
@@ -642,14 +680,14 @@ def _deployment_banner():
         commit = checkout_commit()
         st.caption(f'서버 checkout 커밋: {commit or "이 환경에서 확인할 수 없음"}')
         st.caption('커밋이 표시되면 GitHub의 해당 브랜치 최신 커밋과 비교할 수 있습니다. '
-                   '파일 일치 표는 이번 패치의 입력·전처리·ML 전달 코드 3개를 검사합니다.')
+                   '파일 일치 표는 이번 패치의 입력·전처리·ML 전달 코드 6개를 검사합니다.')
         if status.get('built_at'):
             st.caption(f"패치 제작 시각 (UTC): {status['built_at']} · 앱 업데이트 시각을 뜻하지 않습니다.")
         if status['error']:
             st.warning(status['error'])
         if status['rows']:
             st.dataframe(status['rows'], hide_index=True, width='stretch')
-        st.caption('기대값과 디스크가 다르면 이 ZIP의 4개 파일을 같은 위치에 올리세요. '
+        st.caption('기대값과 디스크가 다르면 이 ZIP의 파일을 같은 위치에 올리세요. '
                    '디스크와 실행값이 다르면 Streamlit Cloud의 Manage app → Reboot app으로 재시작하세요. '
                    '이 표는 현재 서버의 파일을 확인하며, GitHub 최신 커밋을 직접 조회하지 않습니다.')
         st.caption('이 안내 자체가 보이지 않으면 이전 앱이 실행 중입니다. 배포 대상 저장소·브랜치·메인 파일 경로를 확인하세요.')
@@ -674,7 +712,7 @@ def render():
     _deployment_banner()
     if not compatible_input_files():
         st.error('입력 패치의 파일 버전이 일치하지 않습니다. rslab_web 폴더의 preprocess_core.py, '
-                 'preprocess_ui.py, workflow.py를 같은 ZIP의 파일로 교체한 뒤 앱을 재시작하세요.')
+                 'preprocess_ui.py, workflow.py, ml_ui.py, blank_gate_core.py, blank_gate_ui.py를 같은 ZIP의 파일로 교체한 뒤 앱을 재시작하세요.')
         return
     init_state()
     st.caption('Baseline · SG · BLaPE · Final 결과를 따로 확인·내보내기합니다. '
@@ -705,7 +743,9 @@ def render():
     if not stages:
         stages = ['Raw']
     format_names = {'single': 'Single', 'mapping': 'Mapping · 좌표 있음', 'matrix': '다중 spectrum · 좌표 없음'}
-    view, export, log = st.tabs(['처리 결과 확인', 'CSV · ML 내보내기', '처리 기록'])
+    view, blank, export, log = st.tabs(['처리 결과 확인', 'Blank-gate · 검토', 'CSV · ML 내보내기', '처리 기록'])
+    with blank:
+        blank_gate_ui.render(session)
     with view:
         _result_overview(session, settings)
     with export:

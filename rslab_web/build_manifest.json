@@ -1,9 +1,12 @@
 {
-  "release": "PIPE-2.6.2",
-  "built_at_utc": "2026-10-23T06:28:49+00:00",
+  "release": "GATE-2.7.0",
+  "built_at_utc": "2026-10-23T07:48:12+00:00",
   "sha256": {
-    "preprocess_core.py": "4874b8c06cae1884f2be781c8df6835cb94ccc36ef7fd7434877cb7dd1dd2efa",
-    "preprocess_ui.py": "35da0fc6ac74d9d5ebbd86bdc38d21d79beafa851e05d2ae9cc1b22768193c36",
-    "workflow.py": "07876fd4f942d11281c42b1a1d97355371f042619b0bd5f0a9e5895849bbdc1a"
+    "preprocess_core.py": "5901c514c3ab16d473477989d75949d320de0d9aba7a742fe8c3c83fe972fe74",
+    "preprocess_ui.py": "80d2390e53909b88298b16494f8a27bd8dd048c85eb4d0e7d08b4825610ec5cd",
+    "workflow.py": "d6af3c7a35d7428d72894e08db3f82b84470624b73f994853cc3a4dd33d2a6cb",
+    "ml_ui.py": "cbe8eca659edced91e486311edf6e076f7702a4a7073e151d3cb605281e08f63",
+    "blank_gate_core.py": "e02bc436f57c4e3fe0d6fbef7a35d3ab7125ca0377abb6387c7412a4afa7180b",
+    "blank_gate_ui.py": "22cc0b3012994aeb40240ed46d143cc705903ac2eff5d90f4d760cbff46cc737"
   }
 }

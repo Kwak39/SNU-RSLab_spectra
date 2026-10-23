@@ -10,7 +10,7 @@ import numpy as np
 from . import nnls_core, svm_core
 from . import preprocess_core
 
-INPUT_PATCH = 'PIPE-2.6.2'
+INPUT_PATCH = 'GATE-2.7.0'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
@@ -126,7 +126,7 @@ def make_pool(session, stage):
     data = svm_core.Dataset(axis, _readonly(matrix), ids, sources, names, groups)
     blape = session.blape_result if stage in ('BLaPE', 'Final') else None
     lineage = preprocess_core.stage_lineage(session, stage)
-    provenance = dict(stage=stage, processing_steps=lineage, asls=asdict(session.asls_result['params']),
+    provenance = dict(stage=stage, blank_gate=getattr(session, 'blank_gate_info', None), processing_steps=lineage, asls=asdict(session.asls_result['params']),
                       smoothing=asdict(session.smoothing_result['params']) if session.smoothing_result and
                       'Smoothing' in lineage else None,
                       range=asdict(session.range_result['params']) if session.range_result and

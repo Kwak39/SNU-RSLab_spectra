@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import tempfile
 from collections import Counter
 from dataclasses import replace
@@ -13,10 +14,14 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from . import __version__, analysis, nnls_core, split_ui, svm_core
+from . import __version__, analysis, nnls_core, split_ui, svm_core, blank_gate_core as gate
 from .common import (broken_line, content_hashes, csv_bytes, file_pairs, json_bytes,
                      load_files, signature, zip_bytes)
 from .workflow import clear_results, nnls_from_subset
+
+
+INPUT_PATCH = 'GATE-2.7.0'
+LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def inputs(tool, role, title, loader):
@@ -179,7 +184,24 @@ def _data_mode(tool, pool):
     if st.session_state.get(tool + '_last_input_mode') != mode:
         clear_results(st.session_state, tool)
         st.session_state[tool + '_last_input_mode'] = mode
+    if mode == 'CSV 직접 입력':
+        st.caption('Blank-gate 검토/제외를 적용하려면 입력파일 탭에서 데이터를 불러와 검토한 뒤 ML로 보내세요. 직접 입력 CSV에는 gate를 자동 적용하지 않습니다.')
     return mode == '전처리 데이터'
+
+
+def _pool_ready(pool):
+    info = pool.provenance.get('blank_gate')
+    if info:
+        policy = '확정 blank 제외' if info['policy'] == 'exclude_confirmed' else '전체 포함 (blank 포함)'
+        st.caption(f"전달 데이터: {policy} · gate {'ON' if info['enabled'] else 'OFF'} · "
+                   f"확정 blank {info['confirmed_count']:,} · 제외 {info['removed_count']:,}")
+        session = st.session_state.get('session')
+        if session is not None and (info['state_signature'] != gate.state_signature(session) or
+                info['policy'] != st.session_state.get('bg_ml_policy', info['policy']) or
+                info.get('manual_exclusions', []) != [list(v) for v in sorted(session.excluded_pixels)]):
+            st.warning('Blank 판정/포함 범위/수동 제외가 변경되었습니다. 입력파일 탭에서 ML로 보내기를 다시 눌러주세요.')
+            return False
+    return True
 
 
 def _model_bytes(bundle):
@@ -193,6 +215,8 @@ def classifier(tool):
     st.caption(f'{title} · 동일 전처리 조건·파수축의 TRAIN/TEST를 사용하세요.')
     pool = st.session_state.get('ml_pool')
     pooled = _data_mode(tool, pool)
+    if pooled and not _pool_ready(pool):
+        return
     if pooled:
         train_packet, train_labels, test_packet, test_labels = split_ui.render(tool, pool)
     else:
@@ -285,6 +309,8 @@ def nnls():
     st.caption('Sparse NNLS · REFERENCE는 순물질, TEST는 분석 시료입니다. 기여율은 농도·검출 확률이 아닙니다.')
     pool = st.session_state.get('ml_pool')
     if _data_mode('nnls', pool):
+        if not _pool_ready(pool):
+            return
         ref_rows, ref_labels, test_rows, _ = split_ui.render('nnls', pool)
         refs = _labeled_refs(nnls_from_subset(pool, ref_rows), ref_labels['labels'])
         tests = nnls_from_subset(pool, test_rows)

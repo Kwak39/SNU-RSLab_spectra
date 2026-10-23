@@ -25,9 +25,9 @@ from scipy.linalg import solveh_banded
 from scipy.special import expit
 from scipy.signal import savgol_filter
 
-INPUT_PATCH = 'PIPE-2.6.2'
+INPUT_PATCH = 'GATE-2.7.0'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-VERSION = '2.6.2 unified processing overview'
+VERSION = '2.7.0 reviewed reference blank gate'
 
 @dataclass(frozen=True)
 class InputSettings:
@@ -634,6 +634,7 @@ class SpectraSession:
     def clear(self):
         self.items = []; self.kind = None; self.input_settings = None
         self.excluded_pixels = set()  # (file index, spectrum index), export only
+        self.blank_gate = dict(enabled=False, result=None, confirmed=set())
         self.asls_result = None; self.smoothing_result = None; self.range_result = None; self.blape_result = None; self.final_result = None
 
     def load(self, paths, settings=InputSettings(), emit=lambda *a: None, cancel=None):
@@ -1035,8 +1036,10 @@ def stage_lineage(session, stage):
 
 
 def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None):
-    if choice not in ('AsLS', 'Smoothing', 'Range', 'BLaPE', 'Final', 'Both', 'All'):
-        raise ValueError('저장 대상은 AsLS/Range/BLaPE/Final/Both/All 중 하나입니다.')
+    raw_result = dict(arrays=[item['raw'] for item in session.items],
+                      targets=[item['axis'][item['export_order']] for item in session.items])
+    if choice not in ('Raw', 'AsLS', 'Smoothing', 'Range', 'BLaPE', 'Final', 'Both', 'All'):
+        raise ValueError('저장 대상은 Raw/AsLS/Smoothing/Range/BLaPE/Final/Both/All 중 하나입니다.')
     stages = ({'Both':['AsLS','BLaPE'],'All':[k for k,v in [('AsLS',session.asls_result if session.asls_result and session.asls_result['params'].enabled else None),('Smoothing',session.smoothing_result),('Range',session.range_result),('BLaPE',session.blape_result),('Final',session.final_result)] if v is not None]}.get(choice,[choice]))
     if not stages:
         raise ValueError('저장할 활성 단계가 없습니다.')
@@ -1070,6 +1073,7 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
                     asls_single_layout=('not applicable; one CSV per input file' if session.kind != 'single'
                         else 'shared axis' if all(np.array_equal(x,session.asls_result['targets'][0])
                         for x in session.asls_result['targets']) else 'per-file wavenumber/intensity pairs; blank padding'))
+    metadata['blank_gate'] = getattr(session, 'blank_gate_info', None)
     metadata['detected_inputs'] = [dict(file=item['path'].name, kind=item['kind'],
         input_format=item.get('input_format'), spectra=len(item['raw']), points=len(item['axis']),
         data_start_line=item.get('data_start_line'), leading_metadata=item.get('leading_metadata', []),
@@ -1149,11 +1153,11 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
             for fi in indices for pi in kept[fi]])
 
     def write_native(path, indices, stage):
-        snapshot = {'AsLS':session.asls_result,'Smoothing':session.smoothing_result,'Range':session.range_result,'BLaPE':session.blape_result}[stage]
-        orders = ([item['export_order'] for item in session.items] if stage in ('AsLS', 'Smoothing')
+        snapshot = {'Raw':raw_result,'AsLS':session.asls_result,'Smoothing':session.smoothing_result,'Range':session.range_result,'BLaPE':session.blape_result}[stage]
+        orders = ([item['export_order'] for item in session.items] if stage in ('Raw', 'AsLS', 'Smoothing')
                   else snapshot['export_orders'] if stage=='Range'
                   else [np.arange(len(x)) for x in snapshot['targets']])
-        axes = [snapshot['targets'][i] if stage in ('AsLS', 'Smoothing') else snapshot['targets'][i][orders[i]] for i in indices]
+        axes = [snapshot['targets'][i] if stage in ('Raw', 'AsLS', 'Smoothing') else snapshot['targets'][i][orders[i]] for i in indices]
         shared = all(np.array_equal(axis, axes[0]) for axis in axes)
         partial = path.with_suffix('.csv.partial')
         with partial.open('w', encoding='utf-8-sig', newline='') as f:
@@ -1180,10 +1184,10 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
         checkpoint(cancel); partial.rename(path)
 
     def write_result(path, stage, indices, target):
-        if stage in ('AsLS','Smoothing','Range','BLaPE'):
+        if stage in ('Raw','AsLS','Smoothing','Range','BLaPE'):
             return write_native(path, indices, stage)
         partial = path.with_suffix('.csv.partial')
-        snapshot = {'AsLS':session.asls_result,'Range':session.range_result,'BLaPE':session.blape_result,'Final':session.final_result}[stage]
+        snapshot = {'Raw':raw_result,'AsLS':session.asls_result,'Range':session.range_result,'BLaPE':session.blape_result,'Final':session.final_result}[stage]
         with partial.open('w', encoding='utf-8-sig', newline='') as f:
             writer = csv.writer(f)
             write_header(writer, indices)
@@ -1221,7 +1225,7 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
             with (folder/f'{name}_axis_manifest.json').open('w',encoding='utf-8') as stream:
                 json.dump(manifest,stream,indent=2,ensure_ascii=False)
         for stage in stages:
-            snapshot = {'AsLS':session.asls_result,'Smoothing':session.smoothing_result,'Range':session.range_result,'BLaPE':session.blape_result,'Final':session.final_result}[stage]
+            snapshot = {'Raw':raw_result,'AsLS':session.asls_result,'Smoothing':session.smoothing_result,'Range':session.range_result,'BLaPE':session.blape_result,'Final':session.final_result}[stage]
             metadata['output_ranges'][stage] = [[float(x[0]), float(x[-1]), len(x)] for x in snapshot['targets']]
             export_name = session.asls_result['params'].method if stage == 'AsLS' else stage
             if session.kind == 'single':
