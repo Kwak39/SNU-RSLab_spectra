@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "references": {
+    "AgNS_EtOH.txt": {"label": "AgNS in EtOH", "enabled": true},
+    "AgNS_Water.txt": {"label": "AgNS in water", "enabled": true}
+  }
+}
