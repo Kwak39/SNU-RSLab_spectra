@@ -1,9 +1,9 @@
 {
-  "release": "PIPE-2.6.1",
-  "built_at_utc": "2026-10-23T06:07:05+00:00",
+  "release": "PIPE-2.6.2",
+  "built_at_utc": "2026-10-23T06:28:49+00:00",
   "sha256": {
-    "preprocess_core.py": "6d7ee2fc47213705f730787822d25242a2c5c622d617d69def1accd94ab05a4b",
-    "preprocess_ui.py": "a341a26e286d04ff3fe0820ade24164b01215da633965973a4ca2627791f3161",
-    "workflow.py": "88f92c70b31a20a4e53d17a988478d960b9862b938ecc8e90c63c8e179a5ab8e"
+    "preprocess_core.py": "4874b8c06cae1884f2be781c8df6835cb94ccc36ef7fd7434877cb7dd1dd2efa",
+    "preprocess_ui.py": "35da0fc6ac74d9d5ebbd86bdc38d21d79beafa851e05d2ae9cc1b22768193c36",
+    "workflow.py": "07876fd4f942d11281c42b1a1d97355371f042619b0bd5f0a9e5895849bbdc1a"
   }
 }

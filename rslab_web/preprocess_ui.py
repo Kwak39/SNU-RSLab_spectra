@@ -18,7 +18,7 @@ from . import workflow
 from .common import file_pairs
 from .workflow import UploadStore, clear_ml, clear_results, make_pool
 
-INPUT_PATCH = 'PIPE-2.6.1'
+INPUT_PATCH = 'PIPE-2.6.2'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
@@ -115,41 +115,126 @@ def _apply_sg_preview(window, order):
     st.session_state.pre_sg_apply_pending = True
 
 
-def _smoothing_preview(session, settings):
-    st.caption('현재 선택한 spectrum만 실시간 미리보기합니다. 적용 버튼은 전체 파일과 이후 활성 단계를 다시 계산합니다.')
-    a, b, c, d = st.columns([2, 1, 1, 1])
-    fi = a.selectbox('파일', range(len(session.items)), key='sg_preview_file',
-                    format_func=lambda i: session.items[i]['path'].name)
+def _smoothing_preview(session, settings, fi, pi):
+    """Controls share the overview selection; preview only replaces its SG panel."""
+    with st.expander('SG 파라미터 조절 · 같은 spectrum 미리보기'):
+        preview_on = st.checkbox('SG 미리보기 표시', False, key='sg_preview_enabled')
+        a, b, c = st.columns([1, 1, 2], vertical_alignment='bottom')
+        window = int(a.number_input('Window (points)', min_value=3, value=settings['sg_window'],
+                                   step=2, key='sg_preview_window'))
+        order = int(b.number_input('Polynomial order (n)', min_value=0, value=settings['sg_order'],
+                                  step=1, key='sg_preview_order'))
+        if c.button('이 SG 설정 적용 · 전처리', key='sg_apply_preview',
+                    on_click=lambda: _apply_sg_preview(window, order)):
+            st.rerun()
+        current = session.smoothing_result
+        st.caption(f'조절값: window={window}, n={order} · '
+                   + (f'저장된 SG: window={current["params"].window_length}, n={current["params"].polyorder}'
+                      if current else '저장된 SG 결과 없음'))
+        st.caption('미리보기는 아래 SG 칸만 바꿉니다. CSV·ML 및 다른 단계는 저장된 결과를 사용합니다. '
+                   '적용 버튼을 누르면 전체 데이터와 이후 활성 단계를 다시 계산합니다.')
+        if not preview_on:
+            return None
+        try:
+            values = core.smooth_spectrum(session.asls_result['arrays'][fi][pi],
+                                           core.SmoothingSettings(window, order))
+        except ValueError as exc:
+            st.warning(str(exc))
+            return None
+        return (values, window, order)
+
+
+def plot_pipeline(session, fi, pi, sg_preview=None):
+    """Five ordered, independent axes in a compact 3 + 2 layout, always 300 dpi."""
+    available = {'Raw': True, 'AsLS': session.asls_result is not None and session.asls_result['params'].enabled,
+                 'Smoothing': session.smoothing_result is not None,
+                 'BLaPE': session.blape_result is not None, 'Final': session.final_result is not None}
+    titles = {'Raw': '1. Raw', 'AsLS': '2. Baseline correction', 'Smoothing': '3. SG smoothing',
+              'BLaPE': '4. BLaPE', 'Final': '5. Final'}
+    visible = [stage for stage in titles if available[stage] or (stage == 'Smoothing' and sg_preview is not None)]
+    columns = min(3, len(visible))
+    rows = (len(visible)+columns-1)//columns
+    figure, axes = plt.subplots(rows, columns, figsize=(12.3, 2.9*rows), dpi=300, squeeze=False)
+    for axis, stage in zip(axes.flat, visible):
+        title = titles[stage]
+        if stage == 'Smoothing' and sg_preview is not None:
+            values, window, order = sg_preview
+            axis.plot(session.items[fi]['axis'], values, lw=.8, color='#dd7f13')
+            title += f' [PREVIEW w={window}, n={order}]'
+        elif available[stage]:
+            data = session.plot_data(stage, (fi, pi))
+            for _, x, y, _ in data['series']:
+                axis.plot(x, y, lw=.8, color='#2878b5')
+            for lo, hi in data.get('excluded_ranges', []):
+                axis.axvspan(lo, hi, color='#d62728', alpha=.12)
+            if stage == 'AsLS':
+                title += f" ({session.asls_result['params'].method})"
+            elif stage == 'Smoothing':
+                cfg = session.smoothing_result['params']
+                title += f' (w={cfg.window_length}, n={cfg.polyorder})'
+        axis.set_title(title, fontsize=9)
+        axis.set(xlabel='Raman shift (cm$^{-1}$)', ylabel='Intensity')
+        axis.tick_params(labelsize=8)
+    for axis in list(axes.flat)[len(visible):]:
+        figure.delaxes(axis)
+    figure.suptitle(session.label((fi, pi)), fontsize=10)
+    figure.tight_layout(rect=(0, 0, 1, .96))
+    return figure
+
+
+def _result_overview(session, settings):
+    a, b = st.columns([3, 1])
+    fi = a.selectbox('파일', range(len(session.items)),
+                     format_func=lambda i: session.items[i]['path'].name, key='pre_view_file')
     item = session.items[fi]
-    pi = int(b.number_input('Spectrum 번호', min_value=1, max_value=len(item['raw']),
-                            value=1, step=1, key=f'sg_preview_pixel_{fi}_{len(item["raw"])}'))-1
-    window = int(c.number_input('Window (points)', min_value=3, value=settings['sg_window'],
-                                 step=2, key='sg_preview_window'))
-    order = int(d.number_input('Polynomial order (n)', min_value=0, value=settings['sg_order'],
-                                step=1, key='sg_preview_order'))
-    before = session.asls_result['arrays'][fi][pi]
-    try:
-        after = core.smooth_spectrum(before, core.SmoothingSettings(window, order))
-    except ValueError as exc:
-        st.warning(str(exc))
-        return
-    figure, axes = plt.subplots(1, 2, figsize=(8.2, 2.9), dpi=300)
-    axis = item['axis']
-    axes[0].plot(axis, before, lw=.8, label='Before SG')
-    axes[0].set_title('Before SG', fontsize=9)
-    axes[1].plot(axis, after, lw=1, label=f'SG w={window}, n={order}')
-    axes[1].set_title('SG preview', fontsize=9)
-    for ax in axes:
-        ax.set(xlabel='Raman shift (cm$^{-1}$)', ylabel='Intensity'); ax.legend(fontsize=7)
-    figure.tight_layout()
-    st.pyplot(figure, dpi=300); plt.close(figure)
-    current = session.smoothing_result
-    st.caption(f'미리보기: window={window}, n={order} · '
-               + (f'전체 적용값: window={current["params"].window_length}, n={current["params"].polyorder}'
-                  if current else '전체 Smoothing 단계는 아직 적용되지 않았습니다.'))
-    if st.button('이 SG 설정 적용 · 전처리', key='sg_apply_preview',
-                 on_click=lambda: _apply_sg_preview(window, order)):
-        st.rerun()
+    number_key = f'pre_view_pixel_{fi}_{len(item["raw"])}'
+    pi = int(b.number_input('Spectrum 번호', min_value=1, max_value=len(item['raw']), value=1,
+                            step=1, key=number_key)) - 1
+    formats = {'single': 'Single', 'mapping': 'Mapping · 좌표 있음', 'matrix': '다중 spectrum · 좌표 없음'}
+    st.caption(f'{formats[item["kind"]]} · {len(item["raw"]):,} spectra × {len(item["axis"]):,} 원본 points · '
+               f'파수 {item["axis"][0]:.3f}–{item["axis"][-1]:.3f} cm⁻¹')
+    controls, plots = st.columns([1, 4], gap='medium') if item['kind'] != 'single' else (None, None)
+    if controls is not None:
+        with controls:
+            if item['coords'] is not None:
+                x, y = item['coords'][pi]
+                st.caption(f'실제 위치 x={x:g}, y={y:g} · Spectrum {pi+1}')
+                spec = mapping_spec(session, fi, pi)
+            else:
+                first = (pi//100)*100+1
+                st.caption(f'원본 열 순서: {first}–{min(first+99,len(item["raw"]))} / {len(item["raw"])}')
+                st.caption('번호표는 실제 위치 지도가 아닙니다.')
+                spec = index_spec(session, fi, pi)
+            key = f'pre_map_{st.session_state.pre_point_generation}_{fi}_{pi}'
+            st.vega_lite_chart(spec=spec, use_container_width=True, key=key,
+                selection_mode='mapping_pick',
+                on_select=lambda: _mapping_click(key, number_key, len(item['raw'])))
+            st.caption('클릭하면 모든 단계가 같은 spectrum으로 바뀝니다. 주황: 선택 · 파랑: 포함 · 빨강: 제외')
+        with plots:
+            preview = _smoothing_preview(session, settings, fi, pi)
+            _show_pipeline(session, fi, pi, preview)
+    else:
+        preview = _smoothing_preview(session, settings, fi, pi)
+        _show_pipeline(session, fi, pi, preview)
+    _exclusion_controls(session, fi, pi)
+
+
+def _show_pipeline(session, fi, pi, preview):
+    inactive = [name for name, result in [('Baseline', session.asls_result if session.asls_result['params'].enabled else None),
+                 ('SG', session.smoothing_result), ('BLaPE', session.blape_result), ('Final', session.final_result)]
+                if result is None]
+    if inactive:
+        st.caption('OFF / 미완료: ' + ', '.join(inactive))
+    if preview is not None:
+        st.warning('SG 칸은 미리보기입니다. 다른 칸은 마지막 전처리 실행 결과이며, SG 조절값을 적용하려면 적용 버튼을 누르세요.')
+    if session.blape_result is not None:
+        source = session.blape_result['input_stage']
+        if source == 'AsLS':
+            source = session.asls_result['params'].method if session.asls_result['params'].enabled else 'Raw'
+        st.caption(f'실제 BLaPE 입력: {source}. 패널 순서는 처리 단계 목록이며 입력 연결을 뜻하지 않습니다.')
+    figure = plot_pipeline(session, fi, pi, preview)
+    st.pyplot(figure, dpi=300)
+    plt.close(figure)
 
 
 def _picked_spectrum(event, count):
@@ -227,43 +312,6 @@ def index_spec(session, fi, pi):
             dict(mark=dict(type='text', cursor='pointer', color='white', fontSize=10),
                  encoding=dict(text=dict(field='spectrum', type='ordinal')))])
 
-
-def _mapping_tab(session, stages):
-    files = [fi for fi, item in enumerate(session.items) if item['kind'] in ('mapping', 'matrix')]
-    if not files:
-        st.info('좌표 mapping 또는 다중 spectrum 파일을 전처리하면 이 탭에서 지점을 클릭할 수 있습니다.')
-        return
-    a, b, c = st.columns([1, 2, 1])
-    stage = a.selectbox('표시 단계', stages, index=len(stages)-1, key='map_view_stage',
-        format_func=lambda v: session.asls_result['params'].method if v == 'AsLS' else v)
-    fi = b.selectbox('Mapping / 다중 spectrum 파일', files, key='map_view_file',
-                     format_func=lambda i: session.items[i]['path'].name)
-    item = session.items[fi]
-    number_key = f'map_view_pixel_{fi}_{len(item["raw"])}'
-    pi = int(c.number_input('Spectrum 번호', min_value=1, max_value=len(item['raw']),
-                            value=1, step=1, key=number_key))-1
-    location, spectrum = st.columns([1, 3], gap='medium')
-    with location:
-        if item['coords'] is not None:
-            x, y = item['coords'][pi]
-            st.caption(f'실제 위치 x={x:g}, y={y:g} · Spectrum {pi+1}')
-            spec = mapping_spec(session, fi, pi)
-        else:
-            first = (pi//100)*100+1
-            st.caption(f'원본 열 순서의 번호표 · {first}–{min(first+99,len(item["raw"]))} / '
-                       f'{len(item["raw"])} spectra')
-            st.caption('번호를 클릭하세요. 공간 좌표는 파일에 없으며, 번호표는 실제 위치 지도가 아닙니다.')
-            spec = index_spec(session, fi, pi)
-        key = f'map_pick_{st.session_state.pre_point_generation}_{fi}_{pi}'
-        st.vega_lite_chart(spec=spec, use_container_width=True, key=key,
-            selection_mode='mapping_pick',
-            on_select=lambda: _mapping_click(key, number_key, len(item['raw'])))
-        st.caption('주황 테두리: 선택 · 파란색: 포함 · 빨간색: 제외')
-    with spectrum:
-        figure = plot_current(core, session, stage, fi, pi)
-        st.pyplot(figure, dpi=300)
-        plt.close(figure)
-    _exclusion_controls(session, fi, pi, key_prefix='map')
 
 
 def set_excluded(session, fi, pi, excluded, restore_file=False):
@@ -359,6 +407,8 @@ def _settings():
             st.caption('원본 전체 범위·point 유지')
             with st.expander('이상치 보정 (선택)'):
                 anomaly = st.checkbox('보정 사용', False, key='pre_anomaly', disabled=not baseline_enabled)
+                st.caption('양의 spike 후보를 주변 중앙값으로 대체합니다. 좁고 강한 실제 피크도 바뀔 수 있습니다. '
+                           '기준: 주변 중앙값 + Threshold × 전체 표준편차. Window는 좌우 point 수입니다.')
                 a, b = st.columns(2)
                 window = a.number_input('Window', min_value=1, value=5, step=1,
                                         disabled=not anomaly, key='pre_anomaly_window')
@@ -654,50 +704,10 @@ def render():
                    f'{len(result["targets"][0]):,} points · 제외/보호 구간 생략 {result["omitted_points"]:,} points')
     if not stages:
         stages = ['Raw']
-    view, smoothing, mapping, export, log = st.tabs(['처리 결과 확인', 'SG 미리보기', 'Mapping 지점 선택',
-                                        'CSV · ML 내보내기', '처리 기록'])
+    format_names = {'single': 'Single', 'mapping': 'Mapping · 좌표 있음', 'matrix': '다중 spectrum · 좌표 없음'}
+    view, export, log = st.tabs(['처리 결과 확인', 'CSV · ML 내보내기', '처리 기록'])
     with view:
-        a, b, c = st.columns([1, 2, 1])
-        stage = a.selectbox('표시 단계', stages, index=len(stages)-1,
-            format_func=lambda v: session.asls_result['params'].method if v == 'AsLS' else v, key='pre_view_stage')
-        fi = b.selectbox('파일', range(len(session.items)),
-                         format_func=lambda i: session.items[i]['path'].name, key='pre_view_file')
-        item = session.items[fi]
-        number_key = f'pre_view_pixel_{fi}_{len(item["raw"])}'
-        pi = c.number_input('Spectrum 번호', min_value=1, max_value=len(item['raw']), value=1,
-                            step=1, key=number_key) - 1
-        format_names = {'single': 'Single', 'mapping': 'Mapping · 좌표 있음',
-                        'matrix': '다중 spectrum · 좌표 없음'}
-        st.caption(f'{format_names[item["kind"]]} · {len(item["raw"]):,} spectra × '
-                   f'{len(item["axis"]):,} 원본 points · '
-                   f'파수 {item["axis"][0]:.3f}–{item["axis"][-1]:.3f} cm⁻¹')
-        if item['coords'] is not None:
-            x, y = item['coords'][int(pi)]
-            st.caption(f'선택 좌표 x={x:g}, y={y:g}')
-            location, spectrum = st.columns([1, 3], gap='medium')
-            with location:
-                # A fresh selection after a preview change also lets a user
-                # click a previously selected point after entering a number.
-                chart_key = f'pre_map_{st.session_state.pre_point_generation}_{fi}_{int(pi)}'
-                st.vega_lite_chart(spec=mapping_spec(session, fi, int(pi)),
-                    use_container_width=True, key=chart_key, selection_mode='mapping_pick',
-                    on_select=lambda: _mapping_click(chart_key, number_key, len(item['raw'])))
-                st.caption('지점을 클릭하면 오른쪽 spectrum이 바뀝니다. 주황 테두리: 현재 선택')
-            with spectrum:
-                figure = plot_current(core, session, stage, fi, int(pi))
-                st.pyplot(figure, dpi=300)
-                plt.close(figure)
-        elif item['kind'] == 'matrix':
-            st.caption('Spectrum 번호는 원본 intensity 열 순서입니다. 파일에 없는 위치 좌표는 생성하지 않습니다.')
-        if item['coords'] is None:
-            figure = plot_current(core, session, stage, fi, int(pi))
-            st.pyplot(figure, dpi=300)
-            plt.close(figure)
-        _exclusion_controls(session, fi, int(pi))
-    with smoothing:
-        _smoothing_preview(session, settings)
-    with mapping:
-        _mapping_tab(session, stages)
+        _result_overview(session, settings)
     with export:
         _exports(session, stages)
     with log:

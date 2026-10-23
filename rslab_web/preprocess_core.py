@@ -25,9 +25,9 @@ from scipy.linalg import solveh_banded
 from scipy.special import expit
 from scipy.signal import savgol_filter
 
-INPUT_PATCH = 'PIPE-2.6.1'
+INPUT_PATCH = 'PIPE-2.6.2'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-VERSION = '2.6.1 separate stage views and verified deployment'
+VERSION = '2.6.2 unified processing overview'
 
 @dataclass(frozen=True)
 class InputSettings:
