@@ -24,8 +24,8 @@ from scipy.linalg import solveh_banded
 from scipy.special import expit
 from scipy.signal import savgol_filter
 
-INPUT_PATCH = 'TXT-2.5.6'
-VERSION = '2.5.6 variable-length metadata + A1/column-layout + native BLaPE + Final'
+INPUT_PATCH = 'PIPE-2.6.0'
+VERSION = '2.6.0 independent Baseline / Smoothing / BLaPE / Final'
 
 @dataclass(frozen=True)
 class InputSettings:
@@ -35,14 +35,29 @@ class InputSettings:
 
 @dataclass(frozen=True)
 class AsLSSettings:
-    lam: float = 1e6
+    lam: float = 1e5
     p: float = .001
-    niter: int = 10
+    niter: int = 50
     anomaly: bool = False
     anomaly_window: int = 5
     anomaly_threshold: float = 2.0
     method: str = 'AsLS'
     tol: float = 1e-3
+    enabled: bool = True
+
+@dataclass(frozen=True)
+class SmoothingSettings:
+    window_length: int = 11
+    polyorder: int = 3
+
+def smooth_spectrum(row, cfg=SmoothingSettings()):
+    integer(cfg.window_length, 3, 'SG window')
+    integer(cfg.polyorder, 0, 'SG polynomial order')
+    if cfg.window_length % 2 == 0 or cfg.polyorder >= cfg.window_length:
+        raise ValueError('SG window는 홀수이고 polynomial order보다 커야 합니다.')
+    if cfg.window_length > len(row):
+        raise ValueError(f'SG window={cfg.window_length}가 spectrum {len(row)} points보다 큽니다.')
+    return savgol_filter(row, cfg.window_length, cfg.polyorder, deriv=0, mode='interp')
 
 @dataclass(frozen=True)
 class RangeSettings:
@@ -171,10 +186,10 @@ def modified_targets(axes, cfg):
         offset += int(n)
     return [target]*len(axes), bands
 
-def modified_blape(corrected, axis, target, cfg):
+def modified_blape(corrected, axis, target, cfg, pre_smoothed=False):
     segments = modified_segments(axis,cfg)
     if not segments: raise ValueError('modified_BLaPE 계산에 충분한 유효 구간이 없습니다.')
-    corrected = smooth_blape_input(corrected, axis, cfg)
+    corrected = corrected if pre_smoothed else smooth_blape_input(corrected, axis, cfg)
     # Scalar reference computed only from trusted, unmasked samples.
     total = sum(d-c for a,b,c,d in segments)
     mean_abs = sum(float(np.sum(np.abs(corrected[c:d]))) for a,b,c,d in segments)/total
@@ -485,6 +500,8 @@ def anomaly_impute(y, window_size=5, threshold=2.0):
 
 
 def validate_asls(cfg):
+    if not cfg.enabled:
+        return
     positive(cfg.lam, 'lambda')
     if cfg.method not in ('AsLS', 'arPLS'):
         raise ValueError('Baseline 방법은 AsLS 또는 arPLS입니다.')
@@ -496,6 +513,8 @@ def validate_asls(cfg):
     positive(cfg.tol, 'arPLS tolerance')
 
 def correct_one(raw, cfg):
+    if not cfg.enabled:
+        return np.asarray(raw)
     clean = anomaly_impute(raw, cfg.anomaly_window, cfg.anomaly_threshold) if cfg.anomaly else raw
     if cfg.method == 'arPLS':
         return arpls(clean, cfg.lam, cfg.niter, cfg.tol)[1]
@@ -545,13 +564,13 @@ def smooth_blape_input(corrected, axis, cfg):
                                          cfg.sg_order, deriv=0, mode='interp')
     return output
 
-def blape_from_corrected(corrected, axis, target, cfg):
+def blape_from_corrected(corrected, axis, target, cfg, pre_smoothed=False):
     validate_blape(cfg)
     if cfg.exclude_ranges:
-        return modified_blape(corrected,axis,target,cfg)
+        return modified_blape(corrected,axis,target,cfg,pre_smoothed=pre_smoothed)
     if len(axis) < max(9, 2*cfg.edge_trim+2):
         raise ValueError('BLaPE 또는 edge trim에 필요한 입력 point가 부족합니다.')
-    corrected = smooth_blape_input(corrected, axis, cfg)
+    corrected = corrected if pre_smoothed else smooth_blape_input(corrected, axis, cfg)
     smooth = gaussian_filter1d(corrected, cfg.sigma)
     numerator = -np.convolve(smooth, LAPLACIAN, 'same')
     denominator = smooth + cfg.eps*np.mean(np.abs(corrected))
@@ -613,7 +632,7 @@ class SpectraSession:
     def clear(self):
         self.items = []; self.kind = None; self.input_settings = None
         self.excluded_pixels = set()  # (file index, spectrum index), export only
-        self.asls_result = None; self.range_result = None; self.blape_result = None; self.final_result = None
+        self.asls_result = None; self.smoothing_result = None; self.range_result = None; self.blape_result = None; self.final_result = None
 
     def load(self, paths, settings=InputSettings(), emit=lambda *a: None, cancel=None):
         self.clear()
@@ -640,8 +659,13 @@ class SpectraSession:
         validate_asls(cfg)
         if not self.items:
             raise ValueError('먼저 파일을 불러오세요.')
-        self.asls_result = None; self.range_result = None; self.blape_result = None; self.final_result = None
+        self.asls_result = None; self.smoothing_result = None; self.range_result = None; self.blape_result = None; self.final_result = None
         targets = [item['axis'][item['export_order']] for item in self.items]
+        if not cfg.enabled:
+            self.asls_result = dict(params=replace(cfg), arrays=[v['raw'] for v in self.items],
+                                   targets=targets, computed_at=datetime.now().isoformat())
+            emit('log', 'Baseline OFF: 원본 intensity를 다음 단계로 전달합니다.')
+            return self.asls_result
         arrays = []; total = sum(len(v['raw']) for v in self.items); done = 0; last = 0
         for item in self.items:
             corrected = np.empty_like(item['raw'])
@@ -659,6 +683,28 @@ class SpectraSession:
         self.asls_result = dict(params=replace(cfg), arrays=arrays, targets=targets,
                                 computed_at=datetime.now().isoformat())
         return self.asls_result
+
+    def run_smoothing(self, cfg=SmoothingSettings(), emit=lambda *a: None, cancel=None):
+        if self.asls_result is None:
+            raise ValueError('입력 및 Baseline ON/OFF를 먼저 적용하세요.')
+        self.smoothing_result = None; self.blape_result = None; self.final_result = None
+        arrays = []
+        for fi, rows in enumerate(self.asls_result['arrays']):
+            output = np.empty_like(rows)
+            for pi, row in enumerate(rows):
+                checkpoint(cancel)
+                try:
+                    output[pi] = smooth_spectrum(row, cfg)
+                except ValueError as exc:
+                    raise ValueError(f'{self.items[fi]["path"].name}, spectrum {pi+1}: {exc}') from exc
+            arrays.append(output)
+        self.smoothing_result = dict(params=replace(cfg), arrays=arrays,
+            targets=[v['axis'][v['export_order']] for v in self.items],
+            computed_at=datetime.now().isoformat(),
+            asls_computed_at=self.asls_result['computed_at'],
+            input_stage='AsLS' if self.asls_result['params'].enabled else 'Raw')
+        emit('log', f'Smoothing 완료: window={cfg.window_length}, order={cfg.polyorder} · 원본 축 유지')
+        return self.smoothing_result
 
     def run_range(self, cfg=RangeSettings(), emit=lambda *a: None, cancel=None):
         validate_range(cfg)
@@ -700,7 +746,14 @@ class SpectraSession:
         if use_range is None: use_range = False
         if use_range and self.range_result is None:
             raise ValueError('범위 추출 단계를 먼저 실행하세요.')
-        source = self.range_result if use_range else self.asls_result
+        pre_smoothed = cfg.sg_enabled and not use_range
+        if pre_smoothed:
+            sg = SmoothingSettings(cfg.sg_window, cfg.sg_order)
+            if (self.smoothing_result is None or self.smoothing_result['params'] != sg
+                    or self.smoothing_result['asls_computed_at'] != self.asls_result['computed_at']):
+                self.run_smoothing(sg, emit=emit, cancel=cancel)
+        source = (self.range_result if use_range else self.smoothing_result
+                  if pre_smoothed else self.asls_result)
         input_axes = source['targets'] if use_range else [v['axis'] for v in self.items]
         if cfg.sg_enabled:
             emit('log', f'Savitzky-Golay: baseline 후, BLaPE 전에 적용 · '
@@ -736,12 +789,19 @@ class SpectraSession:
         else:
             targets = make_targets([dict(axis=x) for x in input_axes], 'single' if use_range else self.kind, cfg.target_points, cfg.edge_trim)
         arrays = []; total = sum(len(v['raw']) for v in self.items); done = 0; last = 0
-        for item, corrected, axis, target in zip(self.items, source['arrays'], input_axes, targets):
+        for fi, (item, corrected, axis, target) in enumerate(zip(self.items, source['arrays'], input_axes, targets)):
             features = np.empty((len(corrected), len(target)))
             for i, row in enumerate(corrected):
                 checkpoint(cancel)
                 try:
-                    features[i], _ = blape_from_corrected(row, axis, target, cfg)
+                    input_row = row
+                    if pre_smoothed and cfg.exclude_ranges:
+                        # Re-form SG at mask boundaries from the unsmoothed
+                        # baseline, never smooth the SG output a second time.
+                        # This also isolates segment-wide numerical thresholds
+                        # from an arbitrarily large excluded peak.
+                        input_row = smooth_blape_input(self.asls_result['arrays'][fi][i], axis, cfg)
+                    features[i], _ = blape_from_corrected(input_row, axis, target, cfg, pre_smoothed=pre_smoothed)
                 except Exception as exc:
                     raise ValueError(f'{item["path"].name}, spectrum {i+1}: {exc}') from exc
                 done += 1; now = time.monotonic()
@@ -753,16 +813,24 @@ class SpectraSession:
                                  bands=bands, bands_by_file=bands_by_file, native_output=cfg.target_points is None, method='modified_BLaPE' if cfg.exclude_ranges else 'BLaPE',
                                  computed_at=datetime.now().isoformat(),
                                  asls_computed_at=self.asls_result['computed_at'],
-                                 input_stage='Range' if use_range else 'AsLS',
+                                 input_stage='Range' if use_range else 'Smoothing' if pre_smoothed else 'AsLS',
                                  input_axes=input_axes,
                                  range_computed_at=self.range_result['computed_at'] if use_range else None)
         return self.blape_result
 
     def run_final(self, cfg=FinalRangeSettings(), emit=lambda *a: None, cancel=None):
-        """Crop/resample completed BLaPE only; keep its normalization unchanged."""
+        """Crop/resample the latest enabled stage without altering its scaling."""
         self.final_result = None
-        if self.blape_result is None:
-            raise ValueError('BLaPE를 먼저 실행하세요.')
+        source_stage = ('BLaPE' if self.blape_result is not None else 'Smoothing'
+                        if self.smoothing_result is not None else 'AsLS')
+        result = (self.blape_result if source_stage == 'BLaPE' else self.smoothing_result
+                  if source_stage == 'Smoothing' else self.asls_result)
+        if result is None:
+            raise ValueError('먼저 입력 데이터를 처리하세요.')
+        if source_stage != 'BLaPE':
+            result = dict(result, targets=[v['axis'] for v in self.items])
+        if source_stage == 'AsLS' and not self.asls_result['params'].enabled:
+            source_stage = 'Raw'
         if not np.isfinite([cfg.lower,cfg.upper,cfg.step]).all() or cfg.lower>=cfg.upper or cfg.step<=0:
             raise ValueError('Final 범위는 유한한 하한 < 상한, 간격은 양수여야 합니다.')
         intervals = (cfg.upper-cfg.lower)/cfg.step
@@ -773,11 +841,11 @@ class SpectraSession:
             raise ValueError('상한-하한이 간격의 정수배여야 양끝을 포함할 수 있습니다. GUI 간격: 1 cm^-1.')
         requested = cfg.lower + np.arange(n+1,dtype=float)*cfg.step
         requested[-1] = cfg.upper
-        result = self.blape_result; supports = [(cfg.lower,cfg.upper)]
+        supports = [(cfg.lower,cfg.upper)]
         for fi,axis in enumerate(result['targets']):
             checkpoint(cancel)
             if cfg.lower < axis[0] or cfg.upper > axis[-1]:
-                raise ValueError(f'{self.items[fi]["path"].name}: edge-trim 후 BLaPE 범위 '
+                raise ValueError(f'{self.items[fi]["path"].name}: {source_stage} 유효 범위 '
                                  f'{axis[0]:.12g}~{axis[-1]:.12g} cm^-1. '
                                  'Final 범위를 줄이거나 더 넓게 측정하세요. 외삽하지 않습니다.')
             supports = intersect_supports(supports,[(v['lower'],v['upper']) for v in bands_for(result,fi)])
@@ -806,13 +874,13 @@ class SpectraSession:
             arrays.append(features)
         checkpoint(cancel)
         self.final_result=dict(params=replace(cfg),arrays=arrays,targets=[target]*len(arrays),
-                               bands=bands,method='BLaPE final range',
+                               bands=bands,method=f'{source_stage} final range', input_stage=source_stage,
                                requested_points=len(requested),omitted_points=len(requested)-len(target),
                                computed_at=datetime.now().isoformat(),
-                               blape_computed_at=result['computed_at'])
+                               blape_computed_at=result['computed_at'] if source_stage == 'BLaPE' else None)
         emit('log',f'Final: 요청 {cfg.lower:g}~{cfg.upper:g}, 간격 {cfg.step:g} cm^-1; '
                    f'{len(target)} points. 제외/경계 보호로 생략: {len(requested)-len(target)} points. '
-                   'BLaPE 재계산/재정규화 없음; 외삽/빈 구간 연결 없음.')
+                   '상위 단계 재계산/재정규화 없음; 외삽/빈 구간 연결 없음.')
         return self.final_result
 
     def select(self, text, tolerance=1e-6):
@@ -858,56 +926,51 @@ class SpectraSession:
 
     def plot_data(self, stage, selected, cancel=None):
         checkpoint(cancel)
-        if stage == 'Final':
-            if self.final_result is None:
-                raise ValueError('BLaPE 후 범위 추출(Final)을 먼저 실행하세요.')
-            data=self.plot_data('BLaPE',selected,cancel)
-            fi,pi=selected; result=self.final_result
-            x,y=drawing_axis(result['targets'][fi],result['arrays'][fi][pi],bands_for(result,fi))
-            data['series']=[v for v in data['series'] if v[0]!=2]+[(2,x,y,'Final BLaPE (uniform grid)')]
-            data['stage']='Final'
-            return data
-        if self.asls_result is None or (stage == 'BLaPE' and self.blape_result is None) or (stage == 'Range' and self.range_result is None):
-            raise ValueError(f'{stage} 단계를 먼저 실행하세요.')
-        fi, pi = selected; item = self.items[fi]; axis = item['axis']
-        corrected = self.asls_result['arrays'][fi][pi]; raw = item['raw'][pi]
-        cfg = self.asls_result['params']
-        clean = anomaly_impute(raw, cfg.anomaly_window, cfg.anomaly_threshold) if cfg.anomaly else raw
-        baseline = clean-corrected
-        series = [(0, axis, raw, 'Raw'), (0, axis, baseline, f'{cfg.method} baseline'),
-                  (1, axis, corrected, f'{cfg.method} corrected')]
-        if cfg.anomaly:
-            series.insert(1, (0, axis, clean, 'Anomaly corrected'))
+        fi, pi = selected; item = self.items[fi]; axis = item['axis']; raw = item['raw'][pi]
+        series = [(0, axis, raw, 'Raw')]; titles = ['Raw']; panel = 0
+        if stage == 'Raw':
+            return dict(series=series, panel_titles=titles, stage=stage,
+                        label=self.label(selected), excluded_ranges=[])
+        if self.asls_result is None:
+            raise ValueError('먼저 입력 데이터를 처리하세요.')
+        cfg = self.asls_result['params']; corrected = self.asls_result['arrays'][fi][pi]
+        if cfg.enabled:
+            clean = anomaly_impute(raw, cfg.anomaly_window, cfg.anomaly_threshold) if cfg.anomaly else raw
+            series.append((0, axis, clean-corrected, f'{cfg.method} baseline'))
+            panel += 1; titles.append(f'Baseline ({cfg.method})')
+            series.append((panel, axis, corrected, f'{cfg.method} corrected'))
         if stage == 'Range':
-            series = [(0, axis, corrected, 'AsLS full range'),
-                      (1, self.range_result['targets'][fi], self.range_result['arrays'][fi][pi], 'Extracted AsLS (native points)')]
-        if stage == 'BLaPE':
-            result = self.blape_result
-            source = self.range_result if result['input_stage']=='Range' else self.asls_result
-            input_axis = result['input_axes'][fi]; input_row = source['arrays'][fi][pi]
-            series = [v for v in series if v[0] != 1]
-            series.append((1, input_axis, input_row, f'BLaPE input ({cfg.method} corrected)'))
-            if result['params'].sg_enabled:
-                sg_input = smooth_blape_input(input_row, input_axis, result['params'])
-                series.append((1, input_axis, sg_input,
-                               f'Savitzky-Golay (w={result["params"].sg_window}, n={result["params"].sg_order})'))
-            smooth = (blape_from_corrected(input_row,input_axis,result['targets'][fi],result['params'])[1]
-                      if result.get('bands') or result['params'].sg_enabled
-                      else gaussian_filter1d(input_row, result['params'].sigma))
-            plot_x = result['targets'][fi]; plot_y = result['arrays'][fi][pi]
-            if result.get('bands'):
-                # NaNs only for drawing: never draw a line across a masked gap.
-                ends = [v['stop_index'] for v in bands_for(result,fi)[:-1]]
-                plot_x = np.insert(plot_x,ends,np.nan)
-                plot_y = np.insert(plot_y,ends,np.nan)
-            series += [(1, input_axis, smooth, 'Gaussian smoothed'),
-                       (2, plot_x, plot_y, result.get('method','BLaPE'))]
-        checkpoint(cancel)
+            if self.range_result is None: raise ValueError('Range 결과가 없습니다.')
+            panel += 1; titles.append('Range')
+            series.append((panel, self.range_result['targets'][fi], self.range_result['arrays'][fi][pi], 'Range'))
+        include_sg = stage in ('Smoothing', 'BLaPE', 'Final') and self.smoothing_result is not None
+        if stage in ('BLaPE', 'Final') and self.blape_result is not None:
+            include_sg = self.blape_result['input_stage'] == 'Smoothing'
+        if include_sg:
+            result = self.smoothing_result; p = result['params']
+            panel += 1; titles.append('SG smoothing')
+            series += [(panel, axis, corrected, 'Before SG'),
+                       (panel, axis, result['arrays'][fi][pi],
+                        f'Savitzky-Golay (w={p.window_length}, n={p.polyorder})')]
+        elif stage == 'Smoothing':
+            raise ValueError('Smoothing 결과가 없습니다.')
+        if stage in ('BLaPE', 'Final') and self.blape_result is not None:
+            result = self.blape_result; panel += 1; titles.append('BLaPE')
+            x, y = drawing_axis(result['targets'][fi], result['arrays'][fi][pi], bands_for(result, fi))
+            series.append((panel, x, y, result.get('method', 'BLaPE')))
+        elif stage == 'BLaPE':
+            raise ValueError('BLaPE 결과가 없습니다.')
+        if stage == 'Final':
+            if self.final_result is None: raise ValueError('Final 결과가 없습니다.')
+            result = self.final_result; panel += 1; titles.append('Final')
+            x, y = drawing_axis(result['targets'][fi], result['arrays'][fi][pi], bands_for(result, fi))
+            series.append((panel, x, y, 'Final (uniform grid)'))
         excluded = []
-        if stage == 'BLaPE':
+        if stage in ('BLaPE', 'Final') and self.blape_result is not None:
             p = self.blape_result['params']
-            excluded = [(lo-p.exclusion_margin,hi+p.exclusion_margin) for lo,hi in p.exclude_ranges]
-        return dict(series=series, stage=stage, label=self.label(selected), excluded_ranges=excluded)
+            excluded = [(lo-p.exclusion_margin, hi+p.exclusion_margin) for lo, hi in p.exclude_ranges]
+        return dict(series=series, panel_titles=titles, stage=stage,
+                    label=self.label(selected), excluded_ranges=excluded)
 
     def label(self, selected):
         fi, pi = selected; item = self.items[fi]
@@ -974,11 +1037,15 @@ class SpectraSession:
 # %% 6. CSV 저장 — AsLS / BLaPE / Both, 계산/그림과 독립
 
 def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None):
-    if choice not in ('AsLS', 'Range', 'BLaPE', 'Final', 'Both', 'All'):
+    if choice not in ('AsLS', 'Smoothing', 'Range', 'BLaPE', 'Final', 'Both', 'All'):
         raise ValueError('저장 대상은 AsLS/Range/BLaPE/Final/Both/All 중 하나입니다.')
-    stages = ({'Both':['AsLS','BLaPE'],'All':[k for k,v in [('AsLS',session.asls_result),('Range',session.range_result),('BLaPE',session.blape_result),('Final',session.final_result)] if v is not None]}.get(choice,[choice]))
+    stages = ({'Both':['AsLS','BLaPE'],'All':[k for k,v in [('AsLS',session.asls_result if session.asls_result and session.asls_result['params'].enabled else None),('Smoothing',session.smoothing_result),('Range',session.range_result),('BLaPE',session.blape_result),('Final',session.final_result)] if v is not None]}.get(choice,[choice]))
+    if not stages:
+        raise ValueError('저장할 활성 단계가 없습니다.')
     for stage in stages:
-        if session.asls_result is None or (stage == 'BLaPE' and session.blape_result is None) or (stage == 'Range' and session.range_result is None):
+        if (session.asls_result is None or (stage == 'AsLS' and not session.asls_result['params'].enabled)
+                or (stage == 'Smoothing' and session.smoothing_result is None)
+                or (stage == 'BLaPE' and session.blape_result is None) or (stage == 'Range' and session.range_result is None)):
             raise ValueError(f'{stage} 단계를 먼저 실행하세요. 자동 계산하지 않습니다.')
     if 'Final' in stages and session.final_result is None:
         raise ValueError('Final을 먼저 실행하세요. 자동 계산하지 않습니다.')
@@ -997,7 +1064,7 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
                     input_settings=asdict(session.input_settings), mapping_input='A=y; B=x',
                     asls_parameters=asdict(session.asls_result['params']),
                     asls_computed_at=session.asls_result['computed_at'],
-                    baseline_method=session.asls_result['params'].method,
+                    baseline_method=session.asls_result['params'].method if session.asls_result['params'].enabled else 'OFF',
                     baseline_parameters=asdict(session.asls_result['params']),
                     processing_order=f"optional anomaly -> {session.asls_result['params'].method} -> native Gaussian/BLaPE + edge trim -> optional Final crop/interpolation",
                     sigma_unit='native input-axis points; Range does not resample', output_ranges={},
@@ -1010,19 +1077,27 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
         data_start_line=item.get('data_start_line'), leading_metadata=item.get('leading_metadata', []),
         header_detection=item.get('header_detection'),
         coordinates_available=item['coords'] is not None) for item in session.items]
-    if 'Range' in stages or (any(v in stages for v in ('BLaPE','Final')) and session.blape_result['input_stage']=='Range'):
+    has_blape = session.blape_result is not None and any(v in stages for v in ('BLaPE', 'Final'))
+    if 'Range' in stages or (has_blape and session.blape_result['input_stage']=='Range'):
         metadata.update(range_parameters=asdict(session.range_result['params']),
                         range_computed_at=session.range_result['computed_at'],
                         range_snapped_bounds=session.range_result['snapped_bounds'],
                         range_output=[[float(x[0]),float(x[-1]),len(x)] for x in session.range_result['targets']],
                         range_rule='strictly greater for both bounds, inclusive endpoints; native values/count/order in CSV; no interpolation or common-range truncation')
-    if any(v in stages for v in ('BLaPE','Final')):
+    if session.smoothing_result is not None:
+        p = session.smoothing_result['params']
+        metadata['smoothing_parameters'] = dict(method='Savitzky-Golay', enabled=True,
+            window_length=p.window_length, polyorder=p.polyorder, deriv=0, mode='interp',
+            stage='after enabled baseline, before BLaPE', axis='native data points')
+        metadata['processing_order'] = metadata['processing_order'].replace(' -> native Gaussian/BLaPE',
+            ' -> Savitzky-Golay -> native Gaussian/BLaPE')
+    if has_blape:
         sg = session.blape_result['params']
         metadata['smoothing_parameters'] = dict(method='Savitzky-Golay', enabled=sg.sg_enabled,
             window_length=sg.sg_window, polyorder=sg.sg_order, deriv=0, mode='interp',
             stage='after baseline correction, before BLaPE', axis='native data points',
             excluded_intervals='filtered as separate continuous segments')
-        if sg.sg_enabled:
+        if sg.sg_enabled and 'Savitzky-Golay' not in metadata['processing_order']:
             metadata['processing_order'] = metadata['processing_order'].replace(
                 ' -> native Gaussian/BLaPE', ' -> Savitzky-Golay -> native Gaussian/BLaPE')
         metadata['blape_input_stage'] = session.blape_result['input_stage']
@@ -1035,10 +1110,24 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
         metadata['modified_blape_normalization'] = 'Mean abs from trusted native samples; one maximum across all retained output bands; per spectrum.'
     if 'Final' in stages:
         metadata.update(final_parameters=asdict(session.final_result['params']),
+                        final_input_stage=session.final_result.get('input_stage', 'BLaPE'),
                         final_computed_at=session.final_result['computed_at'],
                         final_bands=session.final_result['bands'],
                         final_omitted_points=session.final_result['omitted_points'],
-                        final_rule='Linear interpolation of completed BLaPE; inclusive fixed grid; no extrapolation or interpolation across gaps; no renormalization')
+                        final_rule='Linear interpolation of last enabled stage; inclusive fixed grid; no extrapolation or interpolation across gaps; no renormalization')
+    active = []
+    if session.asls_result['params'].enabled:
+        active.append(session.asls_result['params'].method)
+    if session.smoothing_result is not None:
+        active.append('Savitzky-Golay')
+    if session.blape_result is not None:
+        active.append('native Gaussian/BLaPE + edge trim')
+    if session.final_result is not None:
+        active.append('Final crop/interpolation')
+    metadata['processing_order'] = ' -> '.join(active) or 'Raw'
+    metadata['enabled_steps'] = dict(baseline=session.asls_result['params'].enabled,
+        smoothing=session.smoothing_result is not None, blape=session.blape_result is not None,
+        final=session.final_result is not None)
     metadata['excluded_mapping_pixels'] = [
         dict(file=session.items[fi]['path'].name, spectrum_index_1based=pi+1,
              x=float(session.items[fi]['coords'][pi,0]), y=float(session.items[fi]['coords'][pi,1]))
@@ -1065,11 +1154,11 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
             for fi in indices for pi in kept[fi]])
 
     def write_native(path, indices, stage):
-        snapshot = {'AsLS':session.asls_result,'Range':session.range_result,'BLaPE':session.blape_result}[stage]
-        orders = ([item['export_order'] for item in session.items] if stage=='AsLS'
+        snapshot = {'AsLS':session.asls_result,'Smoothing':session.smoothing_result,'Range':session.range_result,'BLaPE':session.blape_result}[stage]
+        orders = ([item['export_order'] for item in session.items] if stage in ('AsLS', 'Smoothing')
                   else snapshot['export_orders'] if stage=='Range'
                   else [np.arange(len(x)) for x in snapshot['targets']])
-        axes = [snapshot['targets'][i] if stage=='AsLS' else snapshot['targets'][i][orders[i]] for i in indices]
+        axes = [snapshot['targets'][i] if stage in ('AsLS', 'Smoothing') else snapshot['targets'][i][orders[i]] for i in indices]
         shared = all(np.array_equal(axis, axes[0]) for axis in axes)
         partial = path.with_suffix('.csv.partial')
         with partial.open('w', encoding='utf-8-sig', newline='') as f:
@@ -1096,7 +1185,7 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
         checkpoint(cancel); partial.rename(path)
 
     def write_result(path, stage, indices, target):
-        if stage in ('AsLS','Range','BLaPE'):
+        if stage in ('AsLS','Smoothing','Range','BLaPE'):
             return write_native(path, indices, stage)
         partial = path.with_suffix('.csv.partial')
         snapshot = {'AsLS':session.asls_result,'Range':session.range_result,'BLaPE':session.blape_result,'Final':session.final_result}[stage]
@@ -1137,7 +1226,7 @@ def save_session(session, choice, output_root, emit=lambda *a: None, cancel=None
             with (folder/f'{name}_axis_manifest.json').open('w',encoding='utf-8') as stream:
                 json.dump(manifest,stream,indent=2,ensure_ascii=False)
         for stage in stages:
-            snapshot = {'AsLS':session.asls_result,'Range':session.range_result,'BLaPE':session.blape_result,'Final':session.final_result}[stage]
+            snapshot = {'AsLS':session.asls_result,'Smoothing':session.smoothing_result,'Range':session.range_result,'BLaPE':session.blape_result,'Final':session.final_result}[stage]
             metadata['output_ranges'][stage] = [[float(x[0]), float(x[-1]), len(x)] for x in snapshot['targets']]
             export_name = session.asls_result['params'].method if stage == 'AsLS' else stage
             if session.kind == 'single':

@@ -15,7 +15,7 @@ from . import workflow
 from .common import file_pairs
 from .workflow import UploadStore, clear_ml, clear_results, make_pool
 
-INPUT_PATCH = 'TXT-2.5.6'
+INPUT_PATCH = 'PIPE-2.6.0'
 
 
 def compatible_input_files():
@@ -67,9 +67,9 @@ def export_snapshot(session):
 
 
 def make_export_zip(engine, session, include_asls, include_range=False,
-                    include_blape=False, include_final=False):
+                    include_blape=False, include_final=False, include_smoothing=False):
     """Pure download worker: no Streamlit/session-state access or shared folders."""
-    stages = [name for name, selected in [('AsLS', include_asls), ('Range', include_range),
+    stages = [name for name, selected in [('AsLS', include_asls), ('Smoothing', include_smoothing), ('Range', include_range),
               ('BLaPE', include_blape), ('Final', include_final)] if selected]
     if not stages:
         raise ValueError('내보낼 처리 단계를 선택하세요.')
@@ -87,18 +87,68 @@ def make_export_zip(engine, session, include_asls, include_range=False,
 
 def plot_current(engine, session, stage, file_index, spectrum_index):
     data = session.plot_data(stage, (file_index, spectrum_index))
-    count = 3 if stage in ('BLaPE', 'Final') else 2
-    figure, axes = plt.subplots(1, count, figsize=(4.1 * count, 2.9), squeeze=False)
+    count = max(row[0] for row in data['series'])+1
+    # Keep the previous two-/three-panel physical image sizes. Extra enabled
+    # steps share the same maximum width; only raster resolution increases.
+    figure, axes = plt.subplots(1, count, figsize=(4.1 * min(count, 3), 2.9), dpi=300, squeeze=False)
     for row, x, y, label in data['series']:
-        axes[0, row].plot(x, y, lw=.9, label=label)
-    for axis in axes[0]:
+        display_label = label.replace('Savitzky-Golay', 'SG').replace('Final (uniform grid)', 'Final')
+        axes[0, row].plot(x, y, lw=.9, label=display_label)
+    for i, axis in enumerate(axes[0]):
         for lo, hi in data.get('excluded_ranges', []):
             axis.axvspan(lo, hi, color='#d62728', alpha=.15)
         axis.set(xlabel='Raman shift (cm$^{-1}$)', ylabel='Intensity')
-        axis.legend(fontsize=7)
+        axis.legend(fontsize=7, loc='upper right')
+        if data.get('panel_titles'):
+            axis.set_title(data['panel_titles'][i], fontsize=9)
     figure.suptitle(data['label'], fontsize=9)
     figure.tight_layout()
     return figure
+
+
+def _apply_sg_preview(window, order):
+    st.session_state.pre_sg_enabled = True
+    st.session_state.pre_sg_window = int(window)
+    st.session_state.pre_sg_order = int(order)
+    st.session_state.pre_sg_apply_pending = True
+
+
+def _smoothing_preview(session, settings):
+    st.caption('현재 선택한 spectrum만 실시간 미리보기합니다. 적용 버튼은 전체 파일과 이후 활성 단계를 다시 계산합니다.')
+    a, b, c, d = st.columns([2, 1, 1, 1])
+    fi = a.selectbox('파일', range(len(session.items)), key='sg_preview_file',
+                    format_func=lambda i: session.items[i]['path'].name)
+    item = session.items[fi]
+    pi = int(b.number_input('Spectrum 번호', min_value=1, max_value=len(item['raw']),
+                            value=1, step=1, key=f'sg_preview_pixel_{fi}_{len(item["raw"])}'))-1
+    window = int(c.number_input('Window (points)', min_value=3, value=settings['sg_window'],
+                                 step=2, key='sg_preview_window'))
+    order = int(d.number_input('Polynomial order (n)', min_value=0, value=settings['sg_order'],
+                                step=1, key='sg_preview_order'))
+    before = session.asls_result['arrays'][fi][pi]
+    try:
+        after = core.smooth_spectrum(before, core.SmoothingSettings(window, order))
+    except ValueError as exc:
+        st.warning(str(exc))
+        return
+    figure, axes = plt.subplots(1, 2, figsize=(8.2, 2.9), dpi=300)
+    axis = item['axis']
+    axes[0].plot(axis, before, lw=.8, alpha=.65, label='Before SG')
+    axes[0].plot(axis, after, lw=1, label=f'SG w={window}, n={order}')
+    axes[0].set_title('SG before / after', fontsize=9)
+    axes[1].plot(axis, before-after, lw=.8, label='Before - after')
+    axes[1].set_title('Removed component', fontsize=9)
+    for ax in axes:
+        ax.set(xlabel='Raman shift (cm$^{-1}$)', ylabel='Intensity'); ax.legend(fontsize=7)
+    figure.tight_layout()
+    st.pyplot(figure, dpi=300); plt.close(figure)
+    current = session.smoothing_result
+    st.caption(f'미리보기: window={window}, n={order} · '
+               + (f'전체 적용값: window={current["params"].window_length}, n={current["params"].polyorder}'
+                  if current else '전체 Smoothing 단계는 아직 적용되지 않았습니다.'))
+    if st.button('이 SG 설정 적용 · 전처리', key='sg_apply_preview',
+                 on_click=lambda: _apply_sg_preview(window, order)):
+        st.rerun()
 
 
 def _picked_spectrum(event, count):
@@ -210,7 +260,7 @@ def _mapping_tab(session, stages):
         st.caption('주황 테두리: 선택 · 파란색: 포함 · 빨간색: 제외')
     with spectrum:
         figure = plot_current(core, session, stage, fi, pi)
-        st.pyplot(figure)
+        st.pyplot(figure, dpi=300)
         plt.close(figure)
     _exclusion_controls(session, fi, pi, key_prefix='map')
 
@@ -290,23 +340,24 @@ def _settings():
             _input_files()
         with baseline:
             st.markdown('**2 · Baseline correction**')
-            method = st.radio('방법', ['AsLS', 'arPLS'], horizontal=True, key='pre_baseline_method')
+            baseline_enabled = st.checkbox('Baseline correction 사용', True, key='pre_baseline_enabled')
+            method = st.radio('방법', ['AsLS', 'arPLS'], horizontal=True, key='pre_baseline_method', disabled=not baseline_enabled)
             a, b, c = st.columns(3)
-            lam = a.number_input('λ', min_value=1., value=1e6 if method == 'AsLS' else 1e5,
-                format='%.5g', key=f'pre_lambda_{method}')
+            lam = a.number_input('λ', min_value=1., value=1e5,
+                format='%.5g', key=f'pre_lambda_{method}', disabled=not baseline_enabled)
             if method == 'AsLS':
-                p = b.number_input('p', min_value=.000001, max_value=.999999, value=.001,
-                                   format='%.6f', key='pre_asls_p')
+                p = b.number_input('ρ (p)', min_value=.000001, max_value=.999999, value=.001,
+                                   format='%.6f', key='pre_asls_p', disabled=not baseline_enabled)
                 tol = .001
             else:
                 p = .001
                 tol = b.number_input('Tolerance', min_value=.0000001, value=.001,
-                                     format='%.5g', key='pre_arpls_tol')
-            niter = c.number_input('반복 횟수', min_value=1, value=10 if method == 'AsLS' else 50,
-                                  step=1, key=f'pre_iterations_{method}')
+                                     format='%.5g', key='pre_arpls_tol', disabled=not baseline_enabled)
+            niter = c.number_input('N of iterations', min_value=1, value=50,
+                                  step=1, key=f'pre_iterations_{method}', disabled=not baseline_enabled)
             st.caption('원본 전체 범위·point 유지')
             with st.expander('이상치 보정 (선택)'):
-                anomaly = st.checkbox('보정 사용', False, key='pre_anomaly')
+                anomaly = st.checkbox('보정 사용', False, key='pre_anomaly', disabled=not baseline_enabled)
                 a, b = st.columns(2)
                 window = a.number_input('Window', min_value=1, value=5, step=1,
                                         disabled=not anomaly, key='pre_anomaly_window')
@@ -337,22 +388,20 @@ def _settings():
                                          disabled=not enabled, key='pre_exclusion_margin')
             st.caption('Edge trim 후 남은 원본 파수·point 유지')
         a, b, c, d = st.columns([1.15, 1, 1, 1.7], vertical_alignment='bottom')
-        use_final = a.checkbox('5 · Final 범위 추출', True, disabled=not enabled, key='pre_use_final')
+        use_final = a.checkbox('5 · Final 범위 추출', False, key='pre_use_final')
         lower = b.number_input('하한 (cm⁻¹)', value=400., step=1.,
-                               disabled=not (enabled and use_final), key='pre_final_lower')
+                               disabled=not use_final, key='pre_final_lower')
         upper = c.number_input('상한 (cm⁻¹)', value=1500., step=1.,
-                               disabled=not (enabled and use_final), key='pre_final_upper')
+                               disabled=not use_final, key='pre_final_upper')
         with d:
             left, right = st.columns(2)
             run = left.button('전처리 실행', type='primary', width='stretch', key='pre_run')
             existing = st.session_state.session
             final_only = right.button('Final만 재추출', key='pre_final_only', width='stretch',
-                disabled=not (enabled and use_final and existing and existing.blape_result),
-                help='기존 BLaPE에 현재 범위만 적용합니다. Baseline/Smoothing/BLaPE 설정 변경은 전처리 실행으로 적용하세요.')
-        if sg_enabled and not enabled:
-            st.caption('Smoothing은 BLaPE 입력에 적용됩니다. 사용하려면 BLaPE 실행을 켜세요.')
+                disabled=not (use_final and existing and existing.asls_result),
+                help='완료된 마지막 단계에서 범위를 추출합니다. 다른 단계 설정 변경은 전처리 실행으로 적용하세요.')
         st.caption('Final: 양끝 포함 · 1 cm⁻¹ 간격 (400–1500 → 1,101 points). 외삽하거나 제외 구간을 연결하지 않습니다.')
-    return dict(run=run, final_only=final_only, method=method, lam=lam, p=p, tol=tol,
+    return dict(run=run, final_only=final_only, baseline_enabled=baseline_enabled, method=method, lam=lam, p=p, tol=tol,
                 niter=int(niter), anomaly=anomaly, window=int(window), threshold=threshold,
                 enabled=enabled, sigma=sigma, eps=eps, edge=int(edge), exclusions=exclusion_text,
                 margin=margin, use_final=use_final, lower=lower, upper=upper,
@@ -368,15 +417,17 @@ def _run(settings):
         baseline = core.AsLSSettings(lam=float(settings['lam']), p=float(settings['p']),
             niter=settings['niter'], method=settings['method'], tol=float(settings['tol']),
             anomaly=settings['anomaly'], anomaly_window=settings['window'],
-            anomaly_threshold=float(settings['threshold']))
+            anomaly_threshold=float(settings['threshold']), enabled=settings['baseline_enabled'])
+        sg = core.SmoothingSettings(settings['sg_window'], settings['sg_order'])
         blape = core.BLaPESettings(sigma=float(settings['sigma']), eps=float(settings['eps']),
             edge_trim=settings['edge'], target_points=None,
-            exclude_ranges=core.parse_exclusions(settings['exclusions']),
+            exclude_ranges=core.parse_exclusions(settings['exclusions']) if settings['enabled'] else (),
             exclusion_margin=float(settings['margin']), sg_enabled=settings['sg_enabled'],
             sg_window=settings['sg_window'], sg_order=settings['sg_order'])
         input_settings = core.InputSettings()
         load_token = (INPUT_PATCH, core.VERSION, store.revision, input_settings)
-        reused = st.session_state.get('pre_load_token') == load_token and st.session_state.session is not None
+        reused = (st.session_state.get('pre_load_token') == load_token
+                  and st.session_state.session is not None and bool(st.session_state.session.items))
         session = st.session_state.session if reused else core.SpectraSession()
         logs = []
         def emit(kind, value):
@@ -391,21 +442,30 @@ def _run(settings):
                 logs.append(f'{baseline.method}: 동일 조건의 결과 재사용')
             # This application no longer offers a pre-BLaPE crop.
             session.range_result = None
+            if settings['sg_enabled']:
+                if (session.smoothing_result is None or session.smoothing_result['params'] != sg
+                        or session.smoothing_result['asls_computed_at'] != session.asls_result['computed_at']):
+                    session.run_smoothing(sg, emit=emit)
+                else:
+                    logs.append('Smoothing: 동일 조건의 결과 재사용')
+            elif session.smoothing_result is not None:
+                session.smoothing_result = None
+                session.blape_result = session.final_result = None
             if settings['enabled']:
                 if (session.blape_result is None or session.blape_result['params'] != blape
-                        or session.blape_result['input_stage'] != 'AsLS'):
+                        or session.blape_result['input_stage'] != ('Smoothing' if settings['sg_enabled'] else 'AsLS')):
                     session.run_blape(blape, emit=emit, use_range=False)
                 else:
                     logs.append('BLaPE: 동일 조건의 결과 재사용')
-                session.final_result = None
-                if settings['use_final']:
-                    try:
-                        session.run_final(core.FinalRangeSettings(settings['lower'], settings['upper']), emit=emit)
-                    except ValueError as exc:
-                        logs.append(f'Final 미완료: {exc}')
-                        st.warning(f'Baseline/BLaPE 완료. Final 범위를 확인하세요: {exc}')
             else:
-                session.blape_result = session.final_result = None
+                session.blape_result = None
+            session.final_result = None
+            if settings['use_final']:
+                try:
+                    session.run_final(core.FinalRangeSettings(settings['lower'], settings['upper']), emit=emit)
+                except ValueError as exc:
+                    logs.append(f'Final 미완료: {exc}')
+                    st.warning(f'이전 단계 완료. Final 범위를 확인하세요: {exc}')
         st.session_state.session = session
         st.session_state.processed = True
         st.session_state.pre_load_token = load_token
@@ -417,7 +477,8 @@ def _run(settings):
 
 
 def _exports(session, stages):
-    names = {'AsLS': session.asls_result['params'].method, 'BLaPE': 'BLaPE', 'Final': 'Final'}
+    names = {'Raw': 'Raw', 'AsLS': f'Baseline ({session.asls_result["params"].method})',
+             'Smoothing': 'Smoothing (SG)', 'BLaPE': 'BLaPE', 'Final': 'Final'}
     total = sum(len(item['raw']) for item in session.items)
     kept = total - len(session.excluded_pixels)
     st.caption(f'저장·다음 ML 전달 대상 {kept:,} / {total:,} spectra · 제외 {total-kept:,}개')
@@ -427,16 +488,18 @@ def _exports(session, stages):
         st.warning('ML 전달 후 제외 목록이 변경되었습니다. ML로 보내기를 다시 눌러 반영하세요.')
     if not kept:
         st.warning('모든 spectrum이 제외되었습니다. 처리 결과 확인에서 저장할 지점을 복원하세요.')
+    if stages == ['Raw']:
+        st.info('저장할 처리 단계가 꺼져 있습니다. 원하는 단계를 켜고 전처리를 실행하세요. Raw는 ML로 전달할 수 있습니다.')
     left, right = st.columns(2, gap='large')
     with left:
         st.markdown('**CSV ZIP**')
-        cols = st.columns(3)
+        cols = st.columns(4)
         choices = [cols[i].checkbox(names[stage], value=True, key=f'pre_export_{stage}')
-                   if stage in stages else False for i, stage in enumerate(('AsLS', 'BLaPE', 'Final'))]
+                   if stage in stages else False for i, stage in enumerate(('AsLS', 'Smoothing', 'BLaPE', 'Final'))]
         snapshot = export_snapshot(session)
         selection = tuple(choices)
         st.download_button('ZIP 만들기 · 다운로드',
-            data=lambda: make_export_zip(core, snapshot, selection[0], False, selection[1], selection[2]),
+            data=lambda: make_export_zip(core, snapshot, selection[0], False, selection[2], selection[3], selection[1]),
             file_name='RSLab_Spectra_results.zip', mime='application/zip',
             disabled=not any(choices) or not kept, on_click='ignore', key='pre_download', width='stretch')
     with right:
@@ -469,7 +532,8 @@ def render():
     init_state()
     st.caption('파일 누적 → AsLS / arPLS → Savitzky–Golay (선택) → 원본 축 BLaPE → Final 공통축 → ML')
     settings = _settings()
-    if settings['run']:
+    pending_sg = st.session_state.pop('pre_sg_apply_pending', False)
+    if settings['run'] or pending_sg:
         _run(settings)
     elif settings['final_only']:
         try:
@@ -480,7 +544,9 @@ def render():
     session = st.session_state.session
     if not st.session_state.processed or session is None or session.asls_result is None:
         return
-    stages = ['AsLS']
+    stages = ['AsLS'] if session.asls_result['params'].enabled else []
+    if session.smoothing_result is not None:
+        stages.append('Smoothing')
     if session.blape_result is not None:
         stages.append('BLaPE')
     if session.final_result is not None:
@@ -488,7 +554,9 @@ def render():
         result = session.final_result
         st.caption(f'Final {result["params"].lower:g}–{result["params"].upper:g} cm⁻¹ · '
                    f'{len(result["targets"][0]):,} points · 제외/보호 구간 생략 {result["omitted_points"]:,} points')
-    view, mapping, export, log = st.tabs(['처리 결과 확인', 'Mapping 지점 선택',
+    if not stages:
+        stages = ['Raw']
+    view, smoothing, mapping, export, log = st.tabs(['처리 결과 확인', 'SG 미리보기', 'Mapping 지점 선택',
                                         'CSV · ML 내보내기', '처리 기록'])
     with view:
         a, b, c = st.columns([1, 2, 1])
@@ -519,15 +587,17 @@ def render():
                 st.caption('지점을 클릭하면 오른쪽 spectrum이 바뀝니다. 주황 테두리: 현재 선택')
             with spectrum:
                 figure = plot_current(core, session, stage, fi, int(pi))
-                st.pyplot(figure)
+                st.pyplot(figure, dpi=300)
                 plt.close(figure)
         elif item['kind'] == 'matrix':
             st.caption('Spectrum 번호는 원본 intensity 열 순서입니다. 파일에 없는 위치 좌표는 생성하지 않습니다.')
         if item['coords'] is None:
             figure = plot_current(core, session, stage, fi, int(pi))
-            st.pyplot(figure)
+            st.pyplot(figure, dpi=300)
             plt.close(figure)
         _exclusion_controls(session, fi, int(pi))
+    with smoothing:
+        _smoothing_preview(session, settings)
     with mapping:
         _mapping_tab(session, stages)
     with export:
@@ -542,5 +612,5 @@ def render():
         if st.session_state.messages:
             st.code('\n'.join(st.session_state.messages), language='text')
         st.json({name: vars(result['params']) for name, result in
-                 [('Baseline', session.asls_result), ('BLaPE', session.blape_result),
+                 [('Baseline', session.asls_result), ('Smoothing', session.smoothing_result), ('BLaPE', session.blape_result),
                   ('Final', session.final_result)] if result is not None})

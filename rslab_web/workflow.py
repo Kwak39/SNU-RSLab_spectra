@@ -10,7 +10,7 @@ import numpy as np
 from . import nnls_core, svm_core
 from . import preprocess_core
 
-INPUT_PATCH = 'TXT-2.5.6'
+INPUT_PATCH = 'PIPE-2.6.0'
 
 
 class UploadStore:
@@ -86,7 +86,8 @@ def _readonly(array):
 
 
 def make_pool(session, stage):
-    result = {'AsLS': session.asls_result, 'Range': session.range_result,
+    result = {'Raw': dict(arrays=[v['raw'] for v in session.items]),
+              'AsLS': session.asls_result, 'Smoothing': session.smoothing_result, 'Range': session.range_result,
               'BLaPE': session.blape_result, 'Final': getattr(session, 'final_result', None)}.get(stage)
     if result is None:
         raise ValueError(f'{stage} 결과가 없습니다.')
@@ -95,7 +96,7 @@ def make_pool(session, stage):
         kept = [pi for pi in range(len(item['raw'])) if (fi, pi) not in session.excluded_pixels]
         if not kept:
             continue
-        axis = item['axis'] if stage == 'AsLS' else result['targets'][fi]
+        axis = item['axis'] if stage in ('Raw', 'AsLS', 'Smoothing') else result['targets'][fi]
         axes.append(axis)
         block = result['arrays'][fi]
         blocks.append(block if len(kept) == len(block) else block[kept])
@@ -117,17 +118,20 @@ def make_pool(session, stage):
         try:
             svm_core.match_axis(axes[0], axis)
         except ValueError as exc:
-            raise ValueError('전달할 파일들의 파수축이 다릅니다. BLaPE 후 Final 범위를 추출한 뒤 Final 결과를 전달하세요. '
+            raise ValueError('전달할 파일들의 파수축이 다릅니다. Final 범위 추출로 공통 범위·간격을 맞춘 뒤 Final 결과를 전달하세요. '
                              f'상세: {exc}') from exc
     matrix = blocks[0] if len(blocks) == 1 else np.vstack(blocks)
     axis = _readonly(axes[0])
     data = svm_core.Dataset(axis, _readonly(matrix), ids, sources, names, groups)
     blape = session.blape_result if stage in ('BLaPE', 'Final') else None
     provenance = dict(stage=stage, asls=asdict(session.asls_result['params']),
+                      smoothing=asdict(session.smoothing_result['params']) if session.smoothing_result and
+                      stage in ('Smoothing', 'BLaPE', 'Final') else None,
                       range=asdict(session.range_result['params']) if session.range_result and
                       (stage == 'Range' or (blape and blape.get('input_stage') == 'Range')) else None,
                       blape=asdict(blape['params']) if blape else None,
                       final=asdict(result['params']) if stage == 'Final' else None,
+                      final_source=result.get('input_stage') if stage == 'Final' else None,
                       bands=result.get('bands') if stage in ('BLaPE','Final') else None,
                       inputs=[dict(file=item['path'].name, kind=item['kind'],
                                    spectra=len(item['raw']), points=len(item['axis']),
@@ -166,14 +170,15 @@ def subset_packet(pool, indices):
 
 def nnls_packet(session, stage):
     """Direct transfer also supports native, unequal per-file axes for NNLS."""
-    result = {'AsLS': session.asls_result, 'Range': session.range_result,
+    result = {'Raw': dict(arrays=[v['raw'] for v in session.items]),
+              'AsLS': session.asls_result, 'Smoothing': session.smoothing_result, 'Range': session.range_result,
               'BLaPE': session.blape_result, 'Final': getattr(session, 'final_result', None)}[stage]
     if result is None:
         raise ValueError(f'{stage} 결과가 없습니다.')
     spectra = []
     digest = hashlib.sha256(stage.encode())
     for fi, item in enumerate(session.items):
-        axis = item['axis'] if stage == 'AsLS' else result['targets'][fi]
+        axis = item['axis'] if stage in ('Raw', 'AsLS', 'Smoothing') else result['targets'][fi]
         for pi, signal in enumerate(result['arrays'][fi]):
             if (fi, pi) in session.excluded_pixels:
                 continue
