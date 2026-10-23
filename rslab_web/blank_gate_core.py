@@ -11,11 +11,80 @@ import numpy as np
 
 from . import preprocess_core as core
 
-INPUT_PATCH = 'GATE-2.7.0'
+INPUT_PATCH = 'GATE-2.7.1'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-REFERENCE_SLOTS = [('AgNS_EtOH', 'AgNS in EtOH', 'AgNS_EtOH.txt'),
-                   ('AgNS_Water', 'AgNS in water', 'AgNS_Water.txt'),
-                   ('Si_Wafer', 'Si wafer', 'Si_Wafer.txt')]
+REFERENCE_EXTENSIONS = {'.txt', '.csv', '.dat', '.tsv'}
+
+
+def discover_references(folder):
+    """Discover arbitrary filenames; labels live separately in labels.json."""
+    folder = Path(folder)
+    settings_path = folder/'labels.json'
+    settings = {}
+    if settings_path.is_file():
+        try:
+            document = json.loads(settings_path.read_text(encoding='utf-8-sig'))
+            if document.get('schema_version') != 1 or not isinstance(document.get('references'), dict):
+                raise ValueError('schema_version=1 / references 객체가 필요합니다.')
+            settings = document['references']
+        except (OSError, ValueError, AttributeError) as exc:
+            raise ValueError(f'labels.json 읽기 실패: {exc}') from exc
+    records = []
+    for path in sorted(folder.iterdir(), key=lambda p: p.name.casefold()) if folder.is_dir() else []:
+        if not path.is_file() or path.suffix.casefold() not in REFERENCE_EXTENSIONS:
+            continue
+        entry = settings.get(path.name, {})
+        if not isinstance(entry, dict) or not isinstance(entry.get('label', ''), str) or not isinstance(entry.get('enabled', False), bool):
+            raise ValueError(f'{path.name}: Label / 사용 설정 형식을 확인하세요.')
+        records.append(dict(key='folder:'+path.name, filename=path.name, payload=path.read_bytes(),
+                            label=entry.get('label', '').strip(), enabled=entry.get('enabled', False), source='폴더'))
+    return records
+
+
+def add_uploaded_references(records, uploads):
+    """Preserve folder entries; identify uploads by filename and content."""
+    result = [dict(record) for record in records]
+    existing = {(record['filename'].casefold(), hashlib.sha256(record['payload']).hexdigest()) for record in records}
+    for filename, payload in uploads:
+        name = Path(filename.replace('\\', '/')).name
+        if not name or Path(name).suffix.casefold() not in REFERENCE_EXTENSIONS:
+            raise ValueError('Reference는 TXT / CSV / DAT / TSV 파일이어야 합니다.')
+        digest = hashlib.sha256(payload).hexdigest()
+        token = (name.casefold(), digest)
+        if token in existing:
+            continue
+        existing.add(token)
+        result.append(dict(key='upload:'+name+':'+digest, filename=name, payload=payload,
+                           label='', enabled=False, source='이번 세션 업로드'))
+    return result
+
+
+def reference_bundle(records):
+    """One portable folder with original spectra and a separate label manifest."""
+    import io
+    import zipfile
+    used, settings = set(), {}
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:
+        for record in records:
+            name = Path(record['filename'].replace('\\', '/')).name
+            if Path(name).suffix.casefold() not in REFERENCE_EXTENSIONS:
+                raise ValueError('유효하지 않은 reference 확장자입니다.')
+            candidate = name
+            index = 2
+            while candidate.casefold() in used:
+                candidate = f'{Path(name).stem}__{index}{Path(name).suffix}'
+                index += 1
+            used.add(candidate.casefold())
+            label = record['label'].strip()
+            enabled = bool(record['enabled'])
+            if enabled and not label:
+                raise ValueError('사용할 reference의 Label을 입력하세요.')
+            archive.writestr('blank_references/'+candidate, record['payload'])
+            settings[candidate] = dict(label=label, enabled=enabled)
+        archive.writestr('blank_references/labels.json',
+            json.dumps(dict(schema_version=1, references=settings), ensure_ascii=False, indent=2)+'\n')
+    return buffer.getvalue()
 
 
 @dataclass(frozen=True)
@@ -91,7 +160,7 @@ def comparison(block, axis, reference, ref_axis, cfg):
 
 
 def scan_key(session, references, cfg):
-    payload = dict(config=asdict(cfg), references=[(r['key'], r['sha256']) for r in references],
+    payload = dict(config=asdict(cfg), references=[(r['key'], r['sha256'], r['label']) for r in references],
                    core_version=core.VERSION,
                    baseline=session.asls_result['computed_at'],
                    smoothing=session.smoothing_result['asls_computed_at'] if session.smoothing_result else None,

@@ -10,7 +10,7 @@ import numpy as np
 from . import nnls_core, svm_core
 from . import preprocess_core
 
-INPUT_PATCH = 'GATE-2.7.0'
+INPUT_PATCH = 'GATE-2.7.1'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 

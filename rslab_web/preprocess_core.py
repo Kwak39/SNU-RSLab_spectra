@@ -25,9 +25,9 @@ from scipy.linalg import solveh_banded
 from scipy.special import expit
 from scipy.signal import savgol_filter
 
-INPUT_PATCH = 'GATE-2.7.0'
+INPUT_PATCH = 'GATE-2.7.1'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
-VERSION = '2.7.0 reviewed reference blank gate'
+VERSION = '2.7.1 labelled reference catalog'
 
 @dataclass(frozen=True)
 class InputSettings:

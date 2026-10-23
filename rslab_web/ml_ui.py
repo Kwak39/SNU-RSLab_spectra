@@ -20,7 +20,7 @@ from .common import (broken_line, content_hashes, csv_bytes, file_pairs, json_by
 from .workflow import clear_results, nnls_from_subset
 
 
-INPUT_PATCH = 'GATE-2.7.0'
+INPUT_PATCH = 'GATE-2.7.1'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 

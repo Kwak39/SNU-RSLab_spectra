@@ -9,60 +9,91 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import streamlit as st
 
 from . import blank_gate_core as gate
 from . import preprocess_core as core
 
-INPUT_PATCH = 'GATE-2.7.0'
+INPUT_PATCH = 'GATE-2.7.1'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
 def reference_files():
     folder = Path(__file__).resolve().parents[1]/'blank_references'
-    result = []
-    with st.expander('탑재 reference 확인 · 교체 / Si wafer 추가'):
-        for key, label, filename in gate.REFERENCE_SLOTS:
-            upload = st.file_uploader(label, type=['txt', 'csv', 'dat', 'tsv'], key=f'bg_upload_{key}')
-            disk = folder/filename
-            payload = upload.getvalue() if upload is not None else disk.read_bytes() if disk.is_file() else None
-            if payload is None:
-                st.caption(f'{label}: 미등록 · 판정에 사용하지 않음')
-                continue
-            digest = hashlib.sha256(payload).hexdigest()
+    with st.expander('Reference 폴더 · Label / 사용 선택', expanded=True):
+        st.caption('blank_references 폴더의 TXT / CSV / DAT / TSV를 자동으로 찾습니다. '
+                   '파일명과 별개로 Label을 지정하고 사용할 항목을 체크하세요. 같은 Label을 여러 파일에 지정해도 됩니다.')
+        uploads = st.file_uploader('이번 세션에 reference 추가 (선택)',
+            type=['txt', 'csv', 'dat', 'tsv'], accept_multiple_files=True, key='bg_catalog_uploads')
+        try:
+            records = gate.discover_references(folder)
+        except ValueError as exc:
+            st.warning(str(exc))
+            return []
+        try:
+            records = gate.add_uploaded_references(records, [(file.name, file.getvalue()) for file in uploads or []])
+        except ValueError as exc:
+            st.warning(str(exc))
+            return []
+        if not records:
+            st.info('폴더에 reference 파일을 넣거나 이번 세션에 업로드하세요. 파일명은 자유롭게 정할 수 있습니다.')
+            return []
+        edits = st.session_state.setdefault('bg_catalog_edits', {})
+        loaded = []
+        for record in records:
+            digest = hashlib.sha256(record['payload']).hexdigest()
+            cached_key = (record['key'], digest)
             cache = st.session_state.setdefault('bg_reference_cache', {})
-            cache_key = (key, digest)
             try:
-                if cache_key not in cache:
+                if cached_key not in cache:
                     temp = Path(st.session_state.workdir)/'blank_references'
                     temp.mkdir(exist_ok=True)
-                    path = temp/filename
-                    path.write_bytes(payload)
-                    cache[cache_key] = core.read_auto(path, core.InputSettings(), None)
-                item = cache[cache_key]
-                result.append(dict(key=key, label=label, filename=filename, payload=payload,
-                                   sha256=digest, item=item))
-                source = upload.name if upload is not None else filename
-                st.caption(f'{label}: {source} · {len(item["raw"]):,} spectra · '
-                           f'{item["axis"][0]:.2f}–{item["axis"][-1]:.2f} cm⁻¹ · SHA256 {digest[:12]}')
+                    path = temp/(digest+Path(record['filename']).suffix)
+                    path.write_bytes(record['payload'])
+                    cache[cached_key] = core.read_auto(path, core.InputSettings(), None)
+                record['item'], record['sha256'] = cache[cached_key], digest
+                entry = edits.setdefault(record['key'], dict(label=record['label'], enabled=record['enabled']))
+                record.update(label=entry['label'], enabled=entry['enabled'])
+                loaded.append(record)
             except Exception as exc:
-                st.warning(f'{label} reference 읽기 실패: {exc}')
-        if result:
-            saved = [(ref['filename'], ref['payload']) for ref in result]
-            st.download_button('Reference 탑재용 ZIP 다운로드', data=lambda: reference_zip(saved),
-                file_name='RSLab_blank_references.zip', mime='application/zip',
-                on_click='ignore', key='bg_reference_download')
-        st.caption('업로드한 교체 파일은 현재 세션에서 사용합니다. 영구 탑재하려면 ZIP을 풀어 '
-                   'GitHub 저장소 최상위 blank_references 폴더에 넣으세요. 서버 재시작 후에도 불러옵니다.')
-    return result
-
-
-def reference_zip(saved):
-    stream = io.BytesIO()
-    with zipfile.ZipFile(stream, 'w', zipfile.ZIP_DEFLATED) as archive:
-        for filename, payload in saved:
-            archive.writestr('blank_references/'+filename, payload)
-    return stream.getvalue()
+                st.warning(f'{record["filename"]} 읽기 실패 · 판정에서 제외: {exc}')
+        if not loaded:
+            return []
+        table = pd.DataFrame([dict(사용=record['enabled'], 파일=record['filename'], 출처=record['source'],
+            Label=record['label'], Spectra=len(record['item']['raw']),
+            파수범위=f'{record["item"]["axis"][0]:.2f}–{record["item"]["axis"][-1]:.2f}') for record in loaded])
+        identity = hashlib.sha256(str([(record['key'], record['sha256']) for record in loaded]).encode()).hexdigest()[:12]
+        revision = st.session_state.get('bg_catalog_revision', 0)
+        edited = st.data_editor(table, hide_index=True, width='stretch',
+            disabled=['파일', '출처', 'Spectra', '파수범위'], key=f'bg_catalog_editor_{identity}_{revision}')
+        if st.button('Label · 사용 선택 적용', key='bg_catalog_apply'):
+            changes = edited.fillna('').to_dict('records')
+            if any(bool(row['사용']) and not str(row['Label']).strip() for row in changes):
+                st.warning('사용할 reference에는 Label을 입력하세요. 파일명은 Label로 자동 사용하지 않습니다.')
+            else:
+                for record, row in zip(loaded, changes):
+                    edits[record['key']] = dict(label=str(row['Label']).strip(), enabled=bool(row['사용']))
+                st.session_state.bg_catalog_revision = revision+1
+                st.session_state.bg_catalog_notice = 'Label과 사용 선택을 적용했습니다. Gate ON 상태이면 후보 검사를 다시 실행하세요.'
+                st.rerun()
+        if st.session_state.get('bg_catalog_notice'):
+            st.success(st.session_state.pop('bg_catalog_notice'))
+        selected = [record for record in loaded if record['enabled'] and record['label']]
+        invalid_labels = any(record['enabled'] and not record['label'] for record in loaded)
+        pending = any(str(row['Label']).strip() != record['label'] or bool(row['사용']) != record['enabled']
+                      for record, row in zip(loaded, edited.fillna('').to_dict('records')))
+        if pending:
+            st.caption('수정한 Label · 사용 선택은 적용 버튼을 누른 뒤 검사하거나 저장하세요.')
+        st.caption(f'등록 {len(loaded)}개 · 사용 {len(selected)}개 · '
+                   f'Label 미지정 {sum(not record["label"] for record in loaded)}개')
+        st.download_button('Reference + Label 설정 ZIP 저장', data=lambda records=[dict(r) for r in loaded]: gate.reference_bundle(records),
+            file_name='RSLab_blank_references_labelled.zip', mime='application/zip',
+            disabled=invalid_labels or pending, on_click='ignore', key='bg_reference_download')
+        st.caption('적용은 현재 세션에 반영됩니다. 영구 저장하려면 ZIP을 풀어 GitHub 최상위 '
+                   'blank_references 폴더에 spectrum 파일과 labels.json을 함께 올리세요. '
+                   '다음 세션에서 Label과 사용 선택을 다시 불러옵니다.')
+    return selected
 
 
 def report_csv(records):
@@ -85,7 +116,7 @@ def comparison_figure(session, result, row):
     axes[0].plot(item['axis'], values, lw=.8)
     axes[0].set_title(f'Input · {cfg.stage}', fontsize=9)
     axes[1].plot(ref['axis'], ref_values, lw=.8, color='#e38a1d')
-    axes[1].set_title(ref['label'], fontsize=9)
+    axes[1].set_title('Blank reference', fontsize=9)
     left, right = values[comparison['mask']].copy(), comparison['reference'].copy()
     if cfg.metric == 'Pearson':
         left -= left.mean(); right -= right.mean()
@@ -112,10 +143,6 @@ def render(session):
     if state['enabled'] != previous_enabled:
         st.rerun()
     references = reference_files()
-    names = {ref['key']: ref['label'] for ref in references}
-    selected = st.multiselect('비교할 reference', list(names), default=list(names),
-        format_func=lambda key: names[key], key='bg_references')
-    references = [ref for ref in references if ref['key'] in selected]
     options = ['Raw']
     if session.asls_result['params'].enabled:
         options.append('AsLS')
@@ -135,7 +162,7 @@ def render(session):
                '공통 측정 범위에서만 보간하며 외삽하지 않습니다. 최소 30 points가 필요합니다.')
     st.caption('Pearson은 평균값을 뺀 모양, Cosine은 평균값을 유지한 모양을 비교합니다. '
                '0.98은 시작값이며 검증된 blank 판정 기준이 아닙니다. '
-               '탑재한 AgNS reference는 660 nm 측정 자료입니다. 다른 레이저·측정 조건에는 맞는 reference가 필요합니다.')
+               '레이저·용매·기판 등 측정 조건이 맞는 reference를 선택하세요.')
     if not state['enabled']:
         st.info('Blank-gate OFF: blank 판정에 따른 제외는 적용하지 않습니다. 수동 지점 제외는 별도입니다.')
         return
@@ -201,6 +228,8 @@ def render(session):
         if row['reference_index'] is None:
             st.info('비교 가능한 reference가 없습니다. 자동으로 blank 처리하지 않습니다.')
         else:
+            st.caption(f'비교 reference Label: {row["reference"]} · '
+                       f'파일: {result["references"][row["reference_index"]]["filename"]}')
             figure = comparison_figure(session, result, row)
             st.pyplot(figure, dpi=300); plt.close(figure)
         a, b = st.columns(2)

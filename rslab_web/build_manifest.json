@@ -1,12 +1,12 @@
 {
-  "release": "GATE-2.7.0",
-  "built_at_utc": "2026-10-23T07:48:12+00:00",
+  "release": "GATE-2.7.1",
+  "built_at_utc": "2026-10-23T08:36:10+00:00",
   "sha256": {
-    "preprocess_core.py": "5901c514c3ab16d473477989d75949d320de0d9aba7a742fe8c3c83fe972fe74",
-    "preprocess_ui.py": "80d2390e53909b88298b16494f8a27bd8dd048c85eb4d0e7d08b4825610ec5cd",
-    "workflow.py": "d6af3c7a35d7428d72894e08db3f82b84470624b73f994853cc3a4dd33d2a6cb",
-    "ml_ui.py": "cbe8eca659edced91e486311edf6e076f7702a4a7073e151d3cb605281e08f63",
-    "blank_gate_core.py": "e02bc436f57c4e3fe0d6fbef7a35d3ab7125ca0377abb6387c7412a4afa7180b",
-    "blank_gate_ui.py": "22cc0b3012994aeb40240ed46d143cc705903ac2eff5d90f4d760cbff46cc737"
+    "preprocess_core.py": "44dd50ae8c504d32a8e551489f6c26edd5fa8ae18e5d83e8460cd2c5ea03b07d",
+    "preprocess_ui.py": "cd60a3dcf7c8382c060ad1ffa3815a9986a5a755e617ada445ffd68229feb9c8",
+    "workflow.py": "dd1dcab53922428125f52a089e6727b49ff3a4d48b7c66c76c853e8b95af90c6",
+    "ml_ui.py": "1752fb81ba672449604ed565ea2a91cff61004dc40b4a57dc98b3f261c807629",
+    "blank_gate_core.py": "dd3a81453e63ce5d07c4cedf3a565cb016ede4fcbd974e880ba455e84f58c3e7",
+    "blank_gate_ui.py": "b77699533fdcd6dd0605b3762b69c9515a4f10a5bc3da1a5861b8fcab97a4606"
   }
 }

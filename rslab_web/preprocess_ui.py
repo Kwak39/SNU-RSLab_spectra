@@ -20,7 +20,7 @@ from . import blank_gate_core as gate, blank_gate_ui, ml_ui
 from .common import file_pairs
 from .workflow import UploadStore, clear_ml, clear_results, make_pool
 
-INPUT_PATCH = 'GATE-2.7.0'
+INPUT_PATCH = 'GATE-2.7.1'
 LOADED_SOURCE_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
